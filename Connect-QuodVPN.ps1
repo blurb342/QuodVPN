@@ -1,3 +1,6 @@
+# Version must be in first 100 lines for legacy update detection
+$SCRIPT_VERSION = "5.29"
+
 <#
 .SYNOPSIS
     Connects securely to Quod Financial VPN.
@@ -124,7 +127,6 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.29"
 $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
