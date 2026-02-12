@@ -77,11 +77,13 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.29"
+$SCRIPT_VERSION = "5.30"
 $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
+- Config: Settings and credentials now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
+- Config: Script can be moved or updated without losing settings.
 - Auto-Update: Git-native updates via GitHub API (no manual version bumping).
 - Auto-Update: Shows commit message and date when update is available.
 "@
@@ -91,6 +93,13 @@ $QUOD_SECURE_SETTINGS_FILENAME = "secure_settings.dat"
 $QUOD_LOG_FILENAME = "VPNConnectionLog.txt"
 $QUOD_LOG_ARCHIVE_PREFIX = "VPNConnectionLog_"
 $QUOD_LOGS_DIRNAME = "Logs"
+$QUOD_MIGRATION_MARKER = ".quodvpn-migrated"
+
+# --- CENTRALIZED CONFIG DIRECTORY ---
+# Settings and secure credentials are stored in %LOCALAPPDATA%\QuodVPN to decouple
+# config from the script location, allowing the script to be moved or updated without
+# breaking configuration or losing credentials.
+$QUOD_CONFIG_DIRNAME = "QuodVPN"
 
 # --- UPDATE CONFIGURATION ---
 $UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/blurb342/QuodVPN/main/Connect-QuodVPN.ps1"
@@ -130,9 +139,19 @@ else {
     }
 }
 
-$script:SettingsFilePath = Join-Path $scriptRoot $QUOD_SETTINGS_FILENAME
-$script:SecureSettingsFilePath = Join-Path $scriptRoot $QUOD_SECURE_SETTINGS_FILENAME
+# --- CENTRALIZED CONFIG PATH RESOLUTION ---
+# Config/credentials go to %LOCALAPPDATA%\QuodVPN; logs stay with the script.
+$script:ConfigDirectory = Join-Path $env:LOCALAPPDATA $QUOD_CONFIG_DIRNAME
 
+$script:SettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SETTINGS_FILENAME
+$script:SecureSettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SECURE_SETTINGS_FILENAME
+
+# Legacy paths (script directory) - used only for migration detection
+$script:LegacySettingsFilePath = Join-Path $scriptRoot $QUOD_SETTINGS_FILENAME
+$script:LegacySecureSettingsFilePath = Join-Path $scriptRoot $QUOD_SECURE_SETTINGS_FILENAME
+$script:MigrationMarkerPath = Join-Path $scriptRoot $QUOD_MIGRATION_MARKER
+
+# Logs remain in the script directory
 if (-not $LogDirectory) {
     $script:LogDirectory = Join-Path $scriptRoot $QUOD_LOGS_DIRNAME
 } else {
@@ -181,6 +200,157 @@ function Write-Log {
         "Warning"     { <# Warnings displayed in Errors/Warnings section #> }
         "Error"       { <# Errors displayed in Errors/Warnings section #> }
         default       { Write-Host  $entry }
+    }
+}
+
+function Initialize-ConfigDirectory {
+    <#
+    .SYNOPSIS
+        Ensures the centralized config directory exists and migrates legacy settings
+        from the script directory if needed. Handles upgrade, fresh install, and
+        conflict scenarios transparently.
+    .DESCRIPTION
+        Migration logic:
+        1. If central config dir already has settings -> use them (no migration needed).
+        2. If legacy settings exist in script dir but central does not -> migrate (move files).
+        3. If both locations have settings -> central wins (assumed newer); legacy files are
+           renamed with .old suffix as a safety net.
+        4. If neither location has settings -> fresh install; dir is created for future saves.
+
+        A marker file (.quodvpn-migrated) is left in the script directory after migration
+        so users can see where their settings went.
+    #>
+
+    # Ensure central config directory exists
+    if (-not (Test-Path $script:ConfigDirectory)) {
+        try {
+            New-Item -ItemType Directory -Path $script:ConfigDirectory -Force | Out-Null
+            Write-Log "Created config directory: $($script:ConfigDirectory)"
+        } catch {
+            Write-Log "Failed to create config directory: $_" -LogType "Error"
+            Write-Log "Falling back to script directory for settings." -LogType "Warning"
+            $script:SettingsFilePath = $script:LegacySettingsFilePath
+            $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            return
+        }
+    }
+
+    $centralSettingsExist = Test-Path $script:SettingsFilePath
+    $legacySettingsExist  = Test-Path $script:LegacySettingsFilePath
+    $legacySecureExist    = Test-Path $script:LegacySecureSettingsFilePath
+
+    # Case 1: Central config already exists - nothing to migrate
+    if ($centralSettingsExist) {
+        if ($legacySettingsExist -or $legacySecureExist) {
+            # Conflict: files in both locations. Central wins; archive legacy files.
+            Write-Log "Settings found in both central and script directories. Using central config." -LogType "Warning"
+            try {
+                if ($legacySettingsExist) {
+                    $archivePath = "$($script:LegacySettingsFilePath).old"
+                    Move-Item -Path $script:LegacySettingsFilePath -Destination $archivePath -Force
+                    Write-Log "Archived legacy settings to: $archivePath"
+                }
+                if ($legacySecureExist) {
+                    $archivePath = "$($script:LegacySecureSettingsFilePath).old"
+                    Move-Item -Path $script:LegacySecureSettingsFilePath -Destination $archivePath -Force
+                    Write-Log "Archived legacy secure settings to: $archivePath"
+                }
+                Set-MigrationMarker
+            } catch {
+                Write-Log "Warning: Could not archive legacy settings: $_" -LogType "Warning"
+            }
+        }
+        return
+    }
+
+    # Case 2: Legacy settings exist, central does not - perform migration
+    if ($legacySettingsExist) {
+        Write-Host ""
+        Write-Host "Migrating settings to centralized location..." -ForegroundColor Cyan
+        Write-Host "  From: $scriptRoot" -ForegroundColor DarkGray
+        Write-Host "  To:   $($script:ConfigDirectory)" -ForegroundColor DarkGray
+        Write-Log "Migrating settings from script directory to central config directory."
+
+        $migrationSuccess = $true
+
+        # Migrate settings.xml
+        try {
+            Copy-Item -Path $script:LegacySettingsFilePath -Destination $script:SettingsFilePath -Force
+            Write-Log "Migrated $QUOD_SETTINGS_FILENAME to central config."
+        } catch {
+            Write-Log "Failed to migrate $QUOD_SETTINGS_FILENAME`: $_" -LogType "Error"
+            $migrationSuccess = $false
+        }
+
+        # Migrate secure_settings.dat (if it exists)
+        if ($legacySecureExist) {
+            try {
+                Copy-Item -Path $script:LegacySecureSettingsFilePath -Destination $script:SecureSettingsFilePath -Force
+                Write-Log "Migrated $QUOD_SECURE_SETTINGS_FILENAME to central config."
+            } catch {
+                Write-Log "Failed to migrate $QUOD_SECURE_SETTINGS_FILENAME`: $_" -LogType "Error"
+                $migrationSuccess = $false
+            }
+        }
+
+        if ($migrationSuccess) {
+            # Verify migrated files are readable before removing originals
+            $verified = $true
+            if (-not (Test-Path $script:SettingsFilePath)) { $verified = $false }
+            if ($legacySecureExist -and -not (Test-Path $script:SecureSettingsFilePath)) { $verified = $false }
+
+            if ($verified) {
+                # Remove legacy files only after successful migration
+                try {
+                    Remove-Item -Path $script:LegacySettingsFilePath -Force
+                    if ($legacySecureExist) {
+                        Remove-Item -Path $script:LegacySecureSettingsFilePath -Force
+                    }
+                    Write-Log "Removed legacy settings files from script directory."
+                } catch {
+                    Write-Log "Could not remove legacy files (non-critical): $_" -LogType "Warning"
+                }
+                Set-MigrationMarker
+                Write-Host "  Migration complete." -ForegroundColor Green
+                Write-Host ""
+            } else {
+                # Migration copy failed verification - fall back to legacy paths
+                Write-Log "Migration verification failed. Keeping legacy settings." -LogType "Error"
+                $script:SettingsFilePath = $script:LegacySettingsFilePath
+                $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            }
+        } else {
+            # Migration failed - fall back to legacy paths
+            Write-Log "Migration failed. Continuing with settings in script directory." -LogType "Warning"
+            Write-Host "  Migration failed. Using settings from script directory." -ForegroundColor Yellow
+            Write-Host ""
+            $script:SettingsFilePath = $script:LegacySettingsFilePath
+            $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+        }
+        return
+    }
+
+    # Case 3: Neither location has settings - fresh install, directory is ready
+    Write-Log "No existing settings found. Fresh install - config directory ready."
+}
+
+function Set-MigrationMarker {
+    <#
+    .SYNOPSIS
+        Leaves a small marker file in the script directory so users know their settings
+        have been moved to the centralized location.
+    #>
+    try {
+        $markerContent = @"
+QuodVPN settings have been moved to a centralized location.
+New location: $($script:ConfigDirectory)
+
+This file was created during automatic migration and can be safely deleted.
+Migration date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+"@
+        [System.IO.File]::WriteAllText($script:MigrationMarkerPath, $markerContent)
+    } catch {
+        # Non-critical - don't fail if we can't write the marker
     }
 }
 
@@ -677,6 +847,12 @@ function Save-Settings {
     param()
     try {
         Initialize-ProtectedData
+
+        # Ensure config directory exists before saving
+        $configDir = [System.IO.Path]::GetDirectoryName($script:SettingsFilePath)
+        if (-not (Test-Path $configDir)) {
+            New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+        }
 
         $xml = New-Object -TypeName System.Xml.XmlDocument
         $root = $xml.CreateElement("settings")
@@ -1720,7 +1896,8 @@ function Invoke-VpnAddressSelection {
 #region SCRIPT ENTRYPOINT
 try
 {
-    Get-Settings 
+    Initialize-ConfigDirectory
+    Get-Settings
     
     # Check for update on start
     Test-ScriptUpdate
