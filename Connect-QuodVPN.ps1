@@ -1,6 +1,3 @@
-# Version must be in first 100 lines for legacy update detection
-$SCRIPT_VERSION = "5.29"
-
 <#
 .SYNOPSIS
     Connects securely to Quod Financial VPN.
@@ -54,54 +51,7 @@ $SCRIPT_VERSION = "5.29"
     - Reliability: Menu now retries Quod network detection (up to 3x 500ms)
         when VPN shows connected but network not yet detected.
 
-    Update 5.24 (2026-02-09):
-    - Performance: VPN status check now uses fast-path adapter detection
-        (Get-NetAdapter) to avoid slow vpncli.exe calls when disconnected.
-        Reduces UI refresh latency from ~6s to <100ms in most cases.
-    - Performance: Improved caching strategy - Disconnected status cached
-        for 20s, Connected/Unknown cached for 5s.
-    - Reliability: Added 8000ms timeout on vpncli state queries to prevent
-        UI hangs when the Cisco CLI is unresponsive.
-
-    Update 5.23 (2026-02-09):
-    - Security: Improved credential memory handling with proper BSTR cleanup
-        using ZeroFreeBSTR() to minimize password exposure in memory.
-    - Reliability: Added error handling for log file operations and
-        Test-Connection latency measurement with graceful fallbacks.
-    - Configurability: VPN timeouts now configurable via parameters
-        (VpnQueryTimeoutMs, VpnConnectTimeoutMs).
-    - UX: Option 1 now offers choice to Disconnect or Reconnect to a
-        different endpoint when already on Quod network.
-    - Code Quality: Renamed functions to use PowerShell approved verbs
-        (Initialize-, New-, Read-, ConvertFrom-, Test-).
-    - Code Quality: Fixed reserved variable name usage and improved
-        array index validation for user input.
-    
-    Update 5.22 (2026-02-04):
-    - Added live connectivity quality indicators (Excellent/Good/Poor/Bad)
-         in the main header and VPN status panel.
-    - New option 7 runs a connectivity quality test across all configured
-        VPN endpoints and reports per-endpoint latency and quality.
-    - Quick Connect now clearly shows the last VPN target (or [none]) and
-         desktop shortcut creation lives inside the Setup menu with an
-        "Exit without saving" safeguard.
-    
-    Update 5.21:
-    - Fixed QuodFrontEnd kill commands (k1/K) so they log attempts
-      and reliably report/diagnose failures to terminate processes.
-    
-    Update 5.20: 
-    - Protection against null settings file
-    - Auto-updater added with robust batch file approach to handle locked script during update
-
-    Update 5.19:
-    - Fixed missing functions
-    - Added shortcut creation
-    - Improvements to self-update
-
-    Update 5.12:
-    - Improved Path Detection: Switched to $PSCommandPath to fix "Empty Path" errors.
-    - Safety guards remain active to prevent directory deletion.
+    (See git history for older changelog entries)
 
 .NOTES
     Original Author: Medan Gabbay
@@ -127,6 +77,7 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
+$SCRIPT_VERSION = "5.29"
 $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
