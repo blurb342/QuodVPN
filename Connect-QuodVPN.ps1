@@ -5,6 +5,11 @@
 .DESCRIPTION
     PowerShell script to manage Cisco VPN connections.
     
+    Update 5.29 (2026-02-12):
+    - Auto-Update: Now uses GitHub API to detect updates by commit SHA.
+      No manual version bumping required - any commit triggers update.
+    - Auto-Update: Shows latest commit message and date when update available.
+
     Update 5.28 (2026-02-12):
     - Security: Force change update URL to public GIT
 
@@ -119,19 +124,13 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.28"
+$SCRIPT_VERSION = "5.29"
 $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
-- Security: OTP secret now protected with SecureString (matching password).
-- Security: Credential payload uses zeroed char[] instead of .NET strings.
-- Security: Auto-updater verifies download integrity before applying.
-- Robustness: Fixed potential stdout deadlock in all process interactions.
-- Robustness: OTP errors now surfaced clearly instead of silent failure.
-- Robustness: Network detection retries actually re-query DNS.
-- Code Quality: Deduplicated VPN address selection logic.
-- UX: OTP screen validates secret upfront, flicker-free display.
+- Auto-Update: Git-native updates via GitHub API (no manual version bumping).
+- Auto-Update: Shows commit message and date when update is available.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
@@ -142,6 +141,8 @@ $QUOD_LOGS_DIRNAME = "Logs"
 
 # --- UPDATE CONFIGURATION ---
 $UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/blurb342/QuodVPN/main/Connect-QuodVPN.ps1"
+$UPDATE_API_URL    = "https://api.github.com/repos/blurb342/QuodVPN/contents/Connect-QuodVPN.ps1"
+$UPDATE_COMMITS_URL = "https://api.github.com/repos/blurb342/QuodVPN/commits?path=Connect-QuodVPN.ps1&per_page=1"
 
 # Defaults
 if (-not $MaxLogSizeMB) { $MaxLogSizeMB = 5 }
@@ -270,103 +271,146 @@ function New-DesktopShortcut {
     }
 }
 
+function Get-GitBlobSha {
+    <#
+    .SYNOPSIS
+        Calculates the Git blob SHA1 hash for a file (same algorithm Git uses).
+    #>
+    param([string]$FilePath)
+    
+    # Git blob format: "blob <size>\0<content>"
+    $content = [System.IO.File]::ReadAllBytes($FilePath)
+    $header = [System.Text.Encoding]::UTF8.GetBytes("blob $($content.Length)`0")
+    $fullBlob = $header + $content
+    
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    $hashBytes = $sha1.ComputeHash($fullBlob)
+    $sha1.Dispose()
+    
+    return ($hashBytes | ForEach-Object { $_.ToString("x2") }) -join ''
+}
+
 function Test-ScriptUpdate {
-    if (-not $UPDATE_SOURCE_URL) { return }
+    if (-not $UPDATE_SOURCE_URL -or -not $UPDATE_API_URL) { return }
 
     # Show immediate feedback - user sees this before any network call
     Write-Host "Checking for updates... " -ForegroundColor Gray -NoNewline
-    Write-Log "Checking for updates..."
-    try { $currentVersion = [System.Version]$SCRIPT_VERSION } catch { $currentVersion = [System.Version]"0.0" }
+    Write-Log "Checking for updates via GitHub API..."
 
     try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        
+        # 1. Get local file's git blob SHA
+        $localScriptPath = $PSCommandPath
+        if (-not $localScriptPath) { $localScriptPath = $MyInvocation.MyCommand.Definition }
+        if ([string]::IsNullOrWhiteSpace($localScriptPath) -or -not (Test-Path $localScriptPath)) {
+            Write-Host "skipped (cannot determine local script path)." -ForegroundColor DarkGray
+            return
+        }
+        $localBlobSha = Get-GitBlobSha -FilePath $localScriptPath
+        
+        # 2. Query GitHub API for remote file's blob SHA
+        $apiResponse = Invoke-RestMethod -Uri $UPDATE_API_URL -UseBasicParsing -TimeoutSec 5 `
+            -Headers @{ "Accept" = "application/vnd.github.v3+json"; "User-Agent" = "QuodVPN-Updater" }
+        $remoteBlobSha = $apiResponse.sha
+        
+        # 3. Compare blob SHAs - if different, update is available
+        if ($localBlobSha -eq $remoteBlobSha) {
+            Write-Host "up to date." -ForegroundColor Green
+            Write-Log "Script is up to date (SHA: $($localBlobSha.Substring(0,7)))"
+            return
+        }
+        
+        # 4. Fetch latest commit info to show what changed
+        $commitMessage = ""
+        $commitDate = ""
+        $remoteVersion = "unknown"
+        try {
+            $commitInfo = Invoke-RestMethod -Uri $UPDATE_COMMITS_URL -UseBasicParsing -TimeoutSec 3 `
+                -Headers @{ "Accept" = "application/vnd.github.v3+json"; "User-Agent" = "QuodVPN-Updater" }
+            if ($commitInfo -and $commitInfo.Count -gt 0) {
+                $latestCommit = $commitInfo[0]
+                $commitMessage = $latestCommit.commit.message -split "`n" | Select-Object -First 1
+                $commitDate = ([datetime]$latestCommit.commit.committer.date).ToString("yyyy-MM-dd HH:mm")
+            }
+        } catch {
+            Write-Log "Could not fetch commit details: $_" -LogType "Warning"
+        }
+        
+        # 5. Download the new script to extract version number for display
         $rnd = Get-Random
         $tempFile = Join-Path $env:TEMP "Connect-QuodVPN_Update_$rnd.ps1"
-        
-        # 1. Download with timeout to prevent hanging
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $UPDATE_SOURCE_URL -OutFile $tempFile -UseBasicParsing -TimeoutSec 5
         
-        # 2. Version Check
-        if (Test-Path $tempFile) {
-            $contentArr = Get-Content -Path $tempFile -TotalCount 100 
-            $contentStr = $contentArr -join "`n"
-
-            $remoteVersion = $null
-            if ($contentStr -match '\$SCRIPT_VERSION\s*=\s*[''\"](\d+(\.\d+)+)[''\"]') {
-                $remoteVersion = [System.Version]$matches[1]
-            } elseif ($contentStr -match "\.Version\s+(\d+(\.\d+)+)") {
-                $remoteVersion = [System.Version]$matches[1]
+        if (-not (Test-Path $tempFile)) {
+            Write-Host "skipped (download failed)." -ForegroundColor Red
+            return
+        }
+        
+        # Extract version from downloaded file for display
+        $contentArr = Get-Content -Path $tempFile -TotalCount 150
+        $contentStr = $contentArr -join "`n"
+        if ($contentStr -match '\$SCRIPT_VERSION\s*=\s*[''\"](\d+(\.\d+)+)[''\"]') {
+            $remoteVersion = $matches[1]
+        }
+        
+        # Integrity check: verify the download is a valid PowerShell script
+        $downloadedSize = (Get-Item $tempFile).Length
+        $fullContent = Get-Content -Path $tempFile -Raw
+        if ($downloadedSize -lt 1024 -or $fullContent -notmatch 'function\s+') {
+            Write-Host "skipped (download appears corrupt)." -ForegroundColor Red
+            Write-Log "Update integrity check failed: file too small or missing expected content." -LogType "Warning"
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            return
+        }
+        
+        Write-Host "update available!" -ForegroundColor Yellow
+        Clear-Host
+        Write-Host "--- UPDATE AVAILABLE ---" -ForegroundColor Cyan
+        Write-Host "Remote Version : $remoteVersion" -ForegroundColor Yellow
+        Write-Host "Current Version: $SCRIPT_VERSION" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Latest Commit:" -ForegroundColor Cyan
+        if ($commitDate) { Write-Host "  Date   : $commitDate" -ForegroundColor Gray }
+        if ($commitMessage) { Write-Host "  Message: $commitMessage" -ForegroundColor White }
+        Write-Host ""
+        Write-Host "Local SHA : $($localBlobSha.Substring(0,12))..." -ForegroundColor DarkGray
+        Write-Host "Remote SHA: $($remoteBlobSha.Substring(0,12))..." -ForegroundColor DarkGray
+        
+        [Console]::Out.Flush()
+        $choice = Read-Host "`nDo you want to update now? (Y/N)"
+        
+        if ($choice -eq "Y") {
+            Write-Log "Initializing update sequence via Robust Batch..."
+            
+            # Use $PSCommandPath first (Most reliable), fall back to MyInvocation
+            $rawPath = $PSCommandPath
+            if (-not $rawPath) { $rawPath = $MyInvocation.MyCommand.Definition }
+            
+            # Sanitize quotes just in case
+            if ($rawPath -match '^".*"$') { $rawPath = $rawPath.Trim('"') }
+            
+            # SAFETY GUARD 1: Check if path is empty
+            if ([string]::IsNullOrWhiteSpace($rawPath)) {
+                Write-Log "CRITICAL: Update Aborted. Could not determine script path." -LogType "Error"
+                return
             }
-
-            if ($remoteVersion -and $remoteVersion -gt $currentVersion) {
-                # Integrity check: verify the download is a valid PowerShell script
-                $downloadedSize = (Get-Item $tempFile).Length
-                $fullContent = Get-Content -Path $tempFile -Raw
-                if ($downloadedSize -lt 1024 -or
-                    $fullContent -notmatch 'function\s+' -or
-                    $fullContent -notmatch '\$SCRIPT_VERSION') {
-                    Write-Host "skipped (download appears corrupt)." -ForegroundColor Red
-                    Write-Log "Update integrity check failed: file too small or missing expected content." -LogType "Warning"
-                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-                    return
-                }
-
-                # If the remote script publishes a SHA256 hash, verify it
-                $remoteHash = $null
-                if ($contentStr -match '\$SCRIPT_HASH\s*=\s*[''\"]([\dA-Fa-f]{64})[''"]') {
-                    $remoteHash = $matches[1]
-                }
-                if ($remoteHash) {
-                    $localHash = (Get-FileHash -Path $tempFile -Algorithm SHA256).Hash
-                    if ($localHash -ne $remoteHash) {
-                        Write-Host "skipped (hash mismatch)." -ForegroundColor Red
-                        Write-Log "Update hash mismatch: expected $remoteHash, got $localHash." -LogType "Warning"
-                        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-                        return
-                    }
-                }
-
-                Write-Host "update available!" -ForegroundColor Yellow
-                Clear-Host
-                Write-Host "--- UPDATE AVAILABLE ---" -ForegroundColor Cyan
-                Write-Host "New Version: $remoteVersion" -ForegroundColor Yellow
-                Write-Host "Current    : $currentVersion" -ForegroundColor Gray
-
-                [Console]::Out.Flush()
-                $choice = Read-Host "`nDo you want to update now? (Y/N)"
-
-                if ($choice -eq "Y") {
-                    Write-Log "Initializing update sequence via Robust Batch..."
-                    
-                    # --- IMPROVED PATH DETECTION (The Fix) ---
-                    # Use $PSCommandPath first (Most reliable), fall back to MyInvocation
-                    $rawPath = $PSCommandPath
-                    if (-not $rawPath) { $rawPath = $MyInvocation.MyCommand.Definition }
-                    
-                    # Sanitize quotes just in case
-                    if ($rawPath -match '^".*"$') { $rawPath = $rawPath.Trim('"') }
-                    
-                    # SAFETY GUARD 1: Check if path is empty
-                    if ([string]::IsNullOrWhiteSpace($rawPath)) {
-                        Write-Log "CRITICAL: Update Aborted. Could not determine script path." -LogType "Error"
-                        return
-                    }
-                    # SAFETY GUARD 2: Check extension
-                    if (-not $rawPath.EndsWith(".ps1")) {
-                        Write-Log "CRITICAL: Update Aborted. Target is not a .ps1 file: $rawPath" -LogType "Error"
-                        return
-                    }
-                    # SAFETY GUARD 3: Check if Directory
-                    if ((Get-Item $rawPath).PSIsContainer) {
-                        Write-Log "CRITICAL: Update Aborted. Target is a DIRECTORY: $rawPath" -LogType "Error"
-                        return
-                    }
-
-                    $batPath = Join-Path $env:TEMP "VPN_Update.bat"
-                    $logPath = Join-Path $env:TEMP "VPN_Update_Log.txt"
-                    
-                    # --- BATCH FILE ---
-                    $batContent = @" 
+            # SAFETY GUARD 2: Check extension
+            if (-not $rawPath.EndsWith(".ps1")) {
+                Write-Log "CRITICAL: Update Aborted. Target is not a .ps1 file: $rawPath" -LogType "Error"
+                return
+            }
+            # SAFETY GUARD 3: Check if Directory
+            if ((Get-Item $rawPath).PSIsContainer) {
+                Write-Log "CRITICAL: Update Aborted. Target is a DIRECTORY: $rawPath" -LogType "Error"
+                return
+            }
+            
+            $batPath = Join-Path $env:TEMP "VPN_Update.bat"
+            $logPath = Join-Path $env:TEMP "VPN_Update_Log.txt"
+            
+            # --- BATCH FILE ---
+            $batContent = @" 
 @echo off
 echo Starting Update Sequence > "$logPath"
 timeout /t 1 > NUL
@@ -387,17 +431,11 @@ echo Relaunching PowerShell... >> "$logPath"
 start "" powershell -ExecutionPolicy Bypass -File "$rawPath"
 del "%~f0"
 "@
-                    Set-Content -Path $batPath -Value $batContent -Encoding Ascii
-                    Start-Process -FilePath $batPath 
-                    exit 
-                } else {
-                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-                }
-            } else {
-                Write-Host "up to date." -ForegroundColor Green
-                Write-Log "Script is up to date."
-                if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
-            }
+            Set-Content -Path $batPath -Value $batContent -Encoding Ascii
+            Start-Process -FilePath $batPath 
+            exit 
+        } else {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
         }
     } catch {
         Write-Host "skipped (timeout or network error)." -ForegroundColor DarkGray
