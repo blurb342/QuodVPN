@@ -105,6 +105,7 @@ $QUOD_CONFIG_DIRNAME = "QuodVPN"
 $UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/blurb342/QuodVPN/main/Connect-QuodVPN.ps1"
 $UPDATE_API_URL    = "https://api.github.com/repos/blurb342/QuodVPN/contents/Connect-QuodVPN.ps1"
 $UPDATE_COMMITS_URL = "https://api.github.com/repos/blurb342/QuodVPN/commits?path=Connect-QuodVPN.ps1&per_page=1"
+$QUOD_README_URL    = "https://github.com/blurb342/QuodVPN#readme"
 
 # Defaults
 if (-not $MaxLogSizeMB) { $MaxLogSizeMB = 5 }
@@ -1192,7 +1193,7 @@ function Show-MainMenu {
     }
     Write-Host "2. Setup Options"
     Write-Host "O. Show Current OTP"
-    Write-Host "H. README / Help"
+    Write-Host "H. Help / README"
 
     $lastVpnDisplay = if ($script:LastVpnAddress) { $script:LastVpnAddress } else { "[None]" }
     Write-Host ("Q. Quick Connect ({0})" -f $lastVpnDisplay) -ForegroundColor Cyan
@@ -1400,128 +1401,40 @@ function Show-SetupMenu {
 
 function Show-HelpScreen {
     Clear-Host
-    $hColor = "Cyan"      # Headers
-    $tColor = "Gray"      # Text
-    $vColor = "Yellow"    # Variables/Options
-    $wColor = "Green"     # Highlights
-
-    Write-Host "================================================================" -ForegroundColor $hColor
-    Write-Host "QUOD FINANCIAL VPN CONNECTOR - USER MANUAL" -ForegroundColor White
-    Write-Host "================================================================" -ForegroundColor $hColor
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "QUOD FINANCIAL VPN CONNECTOR - HELP" -ForegroundColor White
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Version       : $SCRIPT_VERSION ($VERSION_DATE)" -ForegroundColor Gray
+    Write-Host "Config Dir    : $($script:ConfigDirectory)" -ForegroundColor Gray
+    Write-Host "Log Dir       : $($script:LogDirectory)" -ForegroundColor Gray
     Write-Host ""
 
-    # --- SECTION 1: OVERVIEW ---
-    Write-Host "1. OVERVIEW & CAPABILITIES" -ForegroundColor $hColor
-    Write-Host "--------------------------" -ForegroundColor $tColor
-    Write-Host "This tool is a secure wrapper for the Cisco Secure Client (AnyConnect)." -ForegroundColor $tColor
-    Write-Host "It automates the login process, handles Multi-Factor Authentication (OTP)," -ForegroundColor $tColor
-    Write-Host "and manages connection states without requiring manual data entry every time." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 2: SECURITY ---
-    Write-Host "2. SECURITY ARCHITECTURE" -ForegroundColor $hColor
-    Write-Host "------------------------" -ForegroundColor $tColor
-    Write-Host "A. Credential Storage (DPAPI):" -ForegroundColor $wColor
-    Write-Host "   Your VPN Password and OTP Secret are NOT stored in plain text." -ForegroundColor $tColor
-    Write-Host "   They are encrypted using Windows Data Protection API (DPAPI) with" -ForegroundColor $tColor
-    Write-Host "   'CurrentUser' scope. Only your specific Windows User Account on this" -ForegroundColor $tColor
-    Write-Host "   specific PC can decrypt them. Copied files cannot be decrypted elsewhere." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "B. Injection Security (RAM-Only):" -ForegroundColor $wColor
-    Write-Host "   Credentials are never written to a temporary file during connection." -ForegroundColor $tColor
-    Write-Host "   They are injected directly into the Cisco process memory pipe (StandardInput)," -ForegroundColor $tColor
-    Write-Host "   preventing credential leakage to disk recovery tools." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 3: OTP (MFA) ---
-    Write-Host "3. OTP & MULTI-FACTOR AUTH" -ForegroundColor $hColor
-    Write-Host "--------------------------" -ForegroundColor $tColor
-    Write-Host "The script includes a built-in TOTP (Time-based One-Time Password) generator." -ForegroundColor $tColor
-    Write-Host "If you provide your Base32 Secret Key in the Setup menu:" -ForegroundColor $tColor
-    Write-Host "   - The script automatically generates the 6-digit code during login." -ForegroundColor $tColor
-    Write-Host "   - It appends it to your password seamlessly." -ForegroundColor $tColor
-    Write-Host "   - You can view the live code via menu option [O] to use on other devices." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 4: MENU FUNCTIONS ---
-    Write-Host "4. MENU OPTIONS EXPLAINED" -ForegroundColor $hColor
-    Write-Host "-------------------------" -ForegroundColor $tColor
-    Write-Host "[1] Connect / Disconnect" -ForegroundColor $vColor
-    Write-Host "    Smart toggle. If connected, it cleanly disconnects. If disconnected," -ForegroundColor $tColor
-    Write-Host "    it prompts you to select a gateway from your saved list." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "[2] Setup Options" -ForegroundColor $vColor
-    Write-Host "    Configure your Username, Password, VPN Profile, and Gateway Addresses." -ForegroundColor $tColor
-    Write-Host "    Use this menu if your password changes or you need to add a new server." -ForegroundColor $tColor
-    Write-Host "    From this menu you can also press 'D' to create the desktop" -ForegroundColor $tColor
-    Write-Host "    shortcut with the Ctrl+Alt+V hotkey." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[O] Show Current OTP" -ForegroundColor $vColor
-    Write-Host "    Opens a live TOTP viewer that refreshes every few hundred ms so you" -ForegroundColor $tColor
-    Write-Host "    can read the current 6-digit MFA code without unlocking another app." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[H] README / Help" -ForegroundColor $vColor
-    Write-Host "    Shows this detailed help screen, including security model, menu" -ForegroundColor $tColor
-    Write-Host "    behaviour, connectivity tests, updater and version notes." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[Q] Quick Connect" -ForegroundColor $vColor
-    Write-Host "    Bypasses the server list and connects immediately to the last used" -ForegroundColor $tColor
-    Write-Host "    gateway. The main menu shows 'Quick Connect (VPN name)' where the" -ForegroundColor $tColor
-    Write-Host "    VPN name is your last endpoint, or [None] if you haven't connected yet." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[T] Connectivity Quality Test" -ForegroundColor $vColor
-    Write-Host "    Runs an on-demand quality test against all configured VPN endpoints" -ForegroundColor $tColor
-    Write-Host "    and reports a color-coded quality rating plus average latency in ms." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[L] Open Logs" -ForegroundColor $vColor
-    Write-Host "    Opens the current VPN log file in your default text viewer so you" -ForegroundColor $tColor
-    Write-Host "    can quickly inspect connection history and any error messages." -ForegroundColor $tColor
-    Write-Host ""
-    # Desktop shortcut creation now lives in the Setup menu (option 2 -> 'D').
-
-    # --- SECTION 5: CONFIGURATION ---
-    Write-Host "5. CONFIGURATION DETAILS" -ForegroundColor $hColor
-    Write-Host "------------------------" -ForegroundColor $tColor
-    Write-Host "VPN Profile:" -ForegroundColor $vColor
-    Write-Host "   This must match the 'Group' name configured on the Cisco Firewall" -ForegroundColor $tColor
-    Write-Host "   (e.g., 'SaaSVPN_RD_Profile'). If this is wrong, login will fail." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "VPN Addresses:" -ForegroundColor $vColor
-    Write-Host "   A comma-separated list of your entry points (e.g., london.quod:8443)." -ForegroundColor $tColor
-    Write-Host "   You can manage this list using the List Editor in the Setup menu." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 6: AUTO-UPDATER ---
-    Write-Host "6. AUTO-UPDATER ENGINE" -ForegroundColor $hColor
-    Write-Host "----------------------" -ForegroundColor $tColor
-    Write-Host "The application features a robust, self-healing update engine." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "How it works:" -ForegroundColor $wColor
-    Write-Host "1. Check:" -ForegroundColor $tColor
-    Write-Host "   On launch, it checks a central OneDrive/SharePoint URL for a newer version." -ForegroundColor $tColor
-    Write-Host "2. Safe Download:" -ForegroundColor $tColor
-    Write-Host "   Downloads the update to a randomized temporary file to avoid file locks." -ForegroundColor $tColor
-    Write-Host "3. Execution Lock Bypass:" -ForegroundColor $tColor
-    Write-Host "   Since a running program cannot overwrite itself, the script spawns a" -ForegroundColor $tColor
-    Write-Host "   separate background 'Batch' process." -ForegroundColor $tColor
-    Write-Host "4. The Swap:" -ForegroundColor $tColor
-    Write-Host "   The script closes itself. The background process waits for the lock to release," -ForegroundColor $tColor
-    Write-Host "   swaps the old file for the new one, and relaunches the application." -ForegroundColor $tColor
-    Write-Host "5. Compatibility:" -ForegroundColor $tColor
-    Write-Host "   Works for both the raw PowerShell script (.ps1) and compiled executable (.exe)." -ForegroundColor $tColor
-    Write-Host ""
-    
-    # --- SECTION 7: RELEASE NOTES ---
     if (-not [string]::IsNullOrWhiteSpace($script:VERSION_NOTES)) {
-        Write-Host "7. CURRENT VERSION NOTES ($script:SCRIPT_VERSION)" -ForegroundColor $hColor
-        Write-Host "----------------------------" -ForegroundColor $tColor
-        Write-Host $script:VERSION_NOTES -ForegroundColor $wColor
+        Write-Host "CURRENT VERSION NOTES" -ForegroundColor Cyan
+        Write-Host "---------------------" -ForegroundColor Gray
+        Write-Host $script:VERSION_NOTES -ForegroundColor Green
         Write-Host ""
     }
 
-    Write-Host "Logs are located at: $script:LogDirectory" -ForegroundColor DarkGray
+    Write-Host "Full documentation (README) is available on GitHub:" -ForegroundColor Gray
+    Write-Host "  $QUOD_README_URL" -ForegroundColor Yellow
     Write-Host ""
-    Read-Host "Press Enter to return to the Main Menu"
+    Write-Host "[O] Open README in browser" -ForegroundColor Cyan
+    Write-Host "[Enter] Return to Main Menu" -ForegroundColor Gray
+    Write-Host ""
+    $helpChoice = Read-Host "Choice"
+    if ($helpChoice -ieq 'O') {
+        try {
+            Start-Process $QUOD_README_URL
+            Write-Host "Opened README in your default browser." -ForegroundColor Green
+            Start-Sleep -Seconds 1
+        } catch {
+            Write-Log "Failed to open browser: $_" -LogType "Warning"
+            Write-Host "Could not open browser. Visit the URL above manually." -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+        }
+    }
 }
 
 #endregion
