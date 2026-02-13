@@ -82,8 +82,9 @@ $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
-- Config: Settings and credentials now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
-- Config: Script can be moved or updated without losing settings.
+- Config: Settings, credentials, and logs now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
+- Config: Script can be moved or updated without losing settings or log history.
+- Help: README / Help screen now links to the online GitHub README.
 - Auto-Update: Git-native updates via GitHub API (no manual version bumping).
 - Auto-Update: Shows commit message and date when update is available.
 "@
@@ -141,7 +142,7 @@ else {
 }
 
 # --- CENTRALIZED CONFIG PATH RESOLUTION ---
-# Config/credentials go to %LOCALAPPDATA%\QuodVPN; logs stay with the script.
+# Config, credentials, and logs all live in %LOCALAPPDATA%\QuodVPN.
 $script:ConfigDirectory = Join-Path $env:LOCALAPPDATA $QUOD_CONFIG_DIRNAME
 
 $script:SettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SETTINGS_FILENAME
@@ -151,10 +152,11 @@ $script:SecureSettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SECURE_
 $script:LegacySettingsFilePath = Join-Path $scriptRoot $QUOD_SETTINGS_FILENAME
 $script:LegacySecureSettingsFilePath = Join-Path $scriptRoot $QUOD_SECURE_SETTINGS_FILENAME
 $script:MigrationMarkerPath = Join-Path $scriptRoot $QUOD_MIGRATION_MARKER
+$script:LegacyLogDirectory = Join-Path $scriptRoot $QUOD_LOGS_DIRNAME
 
-# Logs remain in the script directory
+# Logs now live alongside config in the central directory
 if (-not $LogDirectory) {
-    $script:LogDirectory = Join-Path $scriptRoot $QUOD_LOGS_DIRNAME
+    $script:LogDirectory = Join-Path $script:ConfigDirectory $QUOD_LOGS_DIRNAME
 } else {
     $script:LogDirectory = $LogDirectory
 }
@@ -208,8 +210,9 @@ function Initialize-ConfigDirectory {
     <#
     .SYNOPSIS
         Ensures the centralized config directory exists and migrates legacy settings
-        from the script directory if needed. Handles upgrade, fresh install, and
-        conflict scenarios transparently.
+        from the script directory if needed. Log migration is handled separately by
+        Initialize-LogMigration. Handles upgrade, fresh install, and conflict
+        scenarios transparently.
     .DESCRIPTION
         Migration logic:
         1. If central config dir already has settings -> use them (no migration needed).
@@ -339,11 +342,11 @@ function Set-MigrationMarker {
     <#
     .SYNOPSIS
         Leaves a small marker file in the script directory so users know their settings
-        have been moved to the centralized location.
+        and logs have been moved to the centralized location.
     #>
     try {
         $markerContent = @"
-QuodVPN settings have been moved to a centralized location.
+QuodVPN settings and logs have been moved to a centralized location.
 New location: $($script:ConfigDirectory)
 
 This file was created during automatic migration and can be safely deleted.
@@ -353,6 +356,82 @@ Migration date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
     } catch {
         # Non-critical - don't fail if we can't write the marker
     }
+}
+
+function Initialize-LogMigration {
+    <#
+    .SYNOPSIS
+        Migrates log files from the legacy script-directory Logs folder to the
+        centralized %LOCALAPPDATA%\QuodVPN\Logs directory.
+    .DESCRIPTION
+        - Moves archived logs (VPNConnectionLog_*.txt) to the central folder.
+          If a file with the same name already exists, the incoming file is
+          renamed with a _migrated suffix.
+        - For the active log (VPNConnectionLog.txt), if one already exists in
+          the central folder, the legacy content is prepended (older entries
+          first) so the merged file stays chronological.
+        - The legacy Logs folder is removed once empty.
+    #>
+    if (-not (Test-Path $script:LegacyLogDirectory)) { return }
+
+    # Only migrate if the legacy dir actually contains files
+    $legacyLogs = Get-ChildItem -Path $script:LegacyLogDirectory -Filter "*.txt" -File -ErrorAction SilentlyContinue
+    if (-not $legacyLogs -or $legacyLogs.Count -eq 0) { return }
+
+    # Ensure central log directory exists
+    if (-not (Test-Path $script:LogDirectory)) {
+        New-Item -ItemType Directory -Path $script:LogDirectory -Force | Out-Null
+    }
+
+    Write-Host ""
+    Write-Host "Migrating log files to centralized location..." -ForegroundColor Cyan
+    Write-Host "  From: $($script:LegacyLogDirectory)" -ForegroundColor DarkGray
+    Write-Host "  To:   $($script:LogDirectory)" -ForegroundColor DarkGray
+
+    foreach ($logFile in $legacyLogs) {
+        $destPath = Join-Path $script:LogDirectory $logFile.Name
+        try {
+            if ($logFile.Name -eq $QUOD_LOG_FILENAME) {
+                # Active log file - merge if destination exists
+                if (Test-Path $destPath) {
+                    # Prepend legacy content (older) before central content (newer)
+                    $legacyContent = Get-Content -Path $logFile.FullName -Raw -ErrorAction Stop
+                    $centralContent = Get-Content -Path $destPath -Raw -ErrorAction Stop
+                    $separator = "`r`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [Information] - === Log files merged during migration ===`r`n"
+                    [System.IO.File]::WriteAllText($destPath, $legacyContent + $separator + $centralContent)
+                    Remove-Item -Path $logFile.FullName -Force
+                    Write-Log "Merged legacy active log into central log file."
+                } else {
+                    Move-Item -Path $logFile.FullName -Destination $destPath -Force
+                    Write-Log "Migrated active log to central directory."
+                }
+            } else {
+                # Archived log - move, rename on conflict
+                if (Test-Path $destPath) {
+                    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($logFile.Name)
+                    $destPath = Join-Path $script:LogDirectory "${baseName}_migrated.txt"
+                }
+                Move-Item -Path $logFile.FullName -Destination $destPath -Force
+                Write-Log "Migrated archived log: $($logFile.Name)"
+            }
+        } catch {
+            Write-Log "Failed to migrate log file $($logFile.Name): $_" -LogType "Warning"
+        }
+    }
+
+    # Remove legacy Logs folder if now empty
+    try {
+        $remaining = Get-ChildItem -Path $script:LegacyLogDirectory -Force -ErrorAction SilentlyContinue
+        if (-not $remaining -or $remaining.Count -eq 0) {
+            Remove-Item -Path $script:LegacyLogDirectory -Force
+            Write-Log "Removed empty legacy Logs directory."
+        }
+    } catch {
+        Write-Log "Could not remove legacy Logs directory (non-critical): $_" -LogType "Warning"
+    }
+
+    Write-Host "  Log migration complete." -ForegroundColor Green
+    Write-Host ""
 }
 
 function Initialize-ProtectedData {
@@ -864,7 +943,6 @@ function Save-Settings {
         $settingsData = @{
             VpnName         = $script:VpnName
             VpnUsername     = $script:VpnUsername
-            LogDirectory    = $script:LogDirectory
             MaxLogSizeMB    = $script:MaxLogSizeMB
             CiscoVpnCliPath = $script:CiscoVpnCliPath
             CiscoVpnUiPath  = $script:CiscoVpnUiPath
@@ -963,7 +1041,6 @@ function Get-Settings {
             # Basic Strings
             $script:VpnName         = $xml.settings.VpnName
             $script:VpnUsername     = $xml.settings.VpnUsername
-            $script:LogDirectory    = $xml.settings.LogDirectory
             $script:MaxLogSizeMB    = if ($xml.settings.MaxLogSizeMB) { [int]$xml.settings.MaxLogSizeMB } else { 5 }
             $script:CiscoVpnCliPath = $xml.settings.CiscoVpnCliPath
             $script:CiscoVpnUiPath  = $xml.settings.CiscoVpnUiPath
@@ -985,7 +1062,6 @@ function Get-Settings {
             $script:VpnAddresses = @()
             $script:QuodDnsSuffixes = @()
             $script:VpnProfile = ""
-            $script:LogDirectory = Join-Path $scriptRoot "Logs"
         }
 
         # Load secure settings (Existing logic is fine, kept for brevity)
@@ -1810,6 +1886,7 @@ function Invoke-VpnAddressSelection {
 try
 {
     Initialize-ConfigDirectory
+    Initialize-LogMigration
     Get-Settings
     
     # Check for update on start
