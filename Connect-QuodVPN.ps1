@@ -77,11 +77,13 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.29"
+$SCRIPT_VERSION = "5.30"
 $VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
+- Config: Settings and credentials now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
+- Config: Script can be moved or updated without losing settings.
 - Auto-Update: Git-native updates via GitHub API (no manual version bumping).
 - Auto-Update: Shows commit message and date when update is available.
 "@
@@ -91,11 +93,19 @@ $QUOD_SECURE_SETTINGS_FILENAME = "secure_settings.dat"
 $QUOD_LOG_FILENAME = "VPNConnectionLog.txt"
 $QUOD_LOG_ARCHIVE_PREFIX = "VPNConnectionLog_"
 $QUOD_LOGS_DIRNAME = "Logs"
+$QUOD_MIGRATION_MARKER = ".quodvpn-migrated"
+
+# --- CENTRALIZED CONFIG DIRECTORY ---
+# Settings and secure credentials are stored in %LOCALAPPDATA%\QuodVPN to decouple
+# config from the script location, allowing the script to be moved or updated without
+# breaking configuration or losing credentials.
+$QUOD_CONFIG_DIRNAME = "QuodVPN"
 
 # --- UPDATE CONFIGURATION ---
 $UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/blurb342/QuodVPN/main/Connect-QuodVPN.ps1"
 $UPDATE_API_URL    = "https://api.github.com/repos/blurb342/QuodVPN/contents/Connect-QuodVPN.ps1"
 $UPDATE_COMMITS_URL = "https://api.github.com/repos/blurb342/QuodVPN/commits?path=Connect-QuodVPN.ps1&per_page=1"
+$QUOD_README_URL    = "https://github.com/blurb342/QuodVPN#readme"
 
 # Defaults
 if (-not $MaxLogSizeMB) { $MaxLogSizeMB = 5 }
@@ -130,9 +140,19 @@ else {
     }
 }
 
-$script:SettingsFilePath = Join-Path $scriptRoot $QUOD_SETTINGS_FILENAME
-$script:SecureSettingsFilePath = Join-Path $scriptRoot $QUOD_SECURE_SETTINGS_FILENAME
+# --- CENTRALIZED CONFIG PATH RESOLUTION ---
+# Config/credentials go to %LOCALAPPDATA%\QuodVPN; logs stay with the script.
+$script:ConfigDirectory = Join-Path $env:LOCALAPPDATA $QUOD_CONFIG_DIRNAME
 
+$script:SettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SETTINGS_FILENAME
+$script:SecureSettingsFilePath = Join-Path $script:ConfigDirectory $QUOD_SECURE_SETTINGS_FILENAME
+
+# Legacy paths (script directory) - used only for migration detection
+$script:LegacySettingsFilePath = Join-Path $scriptRoot $QUOD_SETTINGS_FILENAME
+$script:LegacySecureSettingsFilePath = Join-Path $scriptRoot $QUOD_SECURE_SETTINGS_FILENAME
+$script:MigrationMarkerPath = Join-Path $scriptRoot $QUOD_MIGRATION_MARKER
+
+# Logs remain in the script directory
 if (-not $LogDirectory) {
     $script:LogDirectory = Join-Path $scriptRoot $QUOD_LOGS_DIRNAME
 } else {
@@ -181,6 +201,157 @@ function Write-Log {
         "Warning"     { <# Warnings displayed in Errors/Warnings section #> }
         "Error"       { <# Errors displayed in Errors/Warnings section #> }
         default       { Write-Host  $entry }
+    }
+}
+
+function Initialize-ConfigDirectory {
+    <#
+    .SYNOPSIS
+        Ensures the centralized config directory exists and migrates legacy settings
+        from the script directory if needed. Handles upgrade, fresh install, and
+        conflict scenarios transparently.
+    .DESCRIPTION
+        Migration logic:
+        1. If central config dir already has settings -> use them (no migration needed).
+        2. If legacy settings exist in script dir but central does not -> migrate (move files).
+        3. If both locations have settings -> central wins (assumed newer); legacy files are
+           renamed with .old suffix as a safety net.
+        4. If neither location has settings -> fresh install; dir is created for future saves.
+
+        A marker file (.quodvpn-migrated) is left in the script directory after migration
+        so users can see where their settings went.
+    #>
+
+    # Ensure central config directory exists
+    if (-not (Test-Path $script:ConfigDirectory)) {
+        try {
+            New-Item -ItemType Directory -Path $script:ConfigDirectory -Force | Out-Null
+            Write-Log "Created config directory: $($script:ConfigDirectory)"
+        } catch {
+            Write-Log "Failed to create config directory: $_" -LogType "Error"
+            Write-Log "Falling back to script directory for settings." -LogType "Warning"
+            $script:SettingsFilePath = $script:LegacySettingsFilePath
+            $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            return
+        }
+    }
+
+    $centralSettingsExist = Test-Path $script:SettingsFilePath
+    $legacySettingsExist  = Test-Path $script:LegacySettingsFilePath
+    $legacySecureExist    = Test-Path $script:LegacySecureSettingsFilePath
+
+    # Case 1: Central config already exists - nothing to migrate
+    if ($centralSettingsExist) {
+        if ($legacySettingsExist -or $legacySecureExist) {
+            # Conflict: files in both locations. Central wins; archive legacy files.
+            Write-Log "Settings found in both central and script directories. Using central config." -LogType "Warning"
+            try {
+                if ($legacySettingsExist) {
+                    $archivePath = "$($script:LegacySettingsFilePath).old"
+                    Move-Item -Path $script:LegacySettingsFilePath -Destination $archivePath -Force
+                    Write-Log "Archived legacy settings to: $archivePath"
+                }
+                if ($legacySecureExist) {
+                    $archivePath = "$($script:LegacySecureSettingsFilePath).old"
+                    Move-Item -Path $script:LegacySecureSettingsFilePath -Destination $archivePath -Force
+                    Write-Log "Archived legacy secure settings to: $archivePath"
+                }
+                Set-MigrationMarker
+            } catch {
+                Write-Log "Warning: Could not archive legacy settings: $_" -LogType "Warning"
+            }
+        }
+        return
+    }
+
+    # Case 2: Legacy settings exist, central does not - perform migration
+    if ($legacySettingsExist) {
+        Write-Host ""
+        Write-Host "Migrating settings to centralized location..." -ForegroundColor Cyan
+        Write-Host "  From: $scriptRoot" -ForegroundColor DarkGray
+        Write-Host "  To:   $($script:ConfigDirectory)" -ForegroundColor DarkGray
+        Write-Log "Migrating settings from script directory to central config directory."
+
+        $migrationSuccess = $true
+
+        # Migrate settings.xml
+        try {
+            Copy-Item -Path $script:LegacySettingsFilePath -Destination $script:SettingsFilePath -Force
+            Write-Log "Migrated $QUOD_SETTINGS_FILENAME to central config."
+        } catch {
+            Write-Log "Failed to migrate $QUOD_SETTINGS_FILENAME`: $_" -LogType "Error"
+            $migrationSuccess = $false
+        }
+
+        # Migrate secure_settings.dat (if it exists)
+        if ($legacySecureExist) {
+            try {
+                Copy-Item -Path $script:LegacySecureSettingsFilePath -Destination $script:SecureSettingsFilePath -Force
+                Write-Log "Migrated $QUOD_SECURE_SETTINGS_FILENAME to central config."
+            } catch {
+                Write-Log "Failed to migrate $QUOD_SECURE_SETTINGS_FILENAME`: $_" -LogType "Error"
+                $migrationSuccess = $false
+            }
+        }
+
+        if ($migrationSuccess) {
+            # Verify migrated files are readable before removing originals
+            $verified = $true
+            if (-not (Test-Path $script:SettingsFilePath)) { $verified = $false }
+            if ($legacySecureExist -and -not (Test-Path $script:SecureSettingsFilePath)) { $verified = $false }
+
+            if ($verified) {
+                # Remove legacy files only after successful migration
+                try {
+                    Remove-Item -Path $script:LegacySettingsFilePath -Force
+                    if ($legacySecureExist) {
+                        Remove-Item -Path $script:LegacySecureSettingsFilePath -Force
+                    }
+                    Write-Log "Removed legacy settings files from script directory."
+                } catch {
+                    Write-Log "Could not remove legacy files (non-critical): $_" -LogType "Warning"
+                }
+                Set-MigrationMarker
+                Write-Host "  Migration complete." -ForegroundColor Green
+                Write-Host ""
+            } else {
+                # Migration copy failed verification - fall back to legacy paths
+                Write-Log "Migration verification failed. Keeping legacy settings." -LogType "Error"
+                $script:SettingsFilePath = $script:LegacySettingsFilePath
+                $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            }
+        } else {
+            # Migration failed - fall back to legacy paths
+            Write-Log "Migration failed. Continuing with settings in script directory." -LogType "Warning"
+            Write-Host "  Migration failed. Using settings from script directory." -ForegroundColor Yellow
+            Write-Host ""
+            $script:SettingsFilePath = $script:LegacySettingsFilePath
+            $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+        }
+        return
+    }
+
+    # Case 3: Neither location has settings - fresh install, directory is ready
+    Write-Log "No existing settings found. Fresh install - config directory ready."
+}
+
+function Set-MigrationMarker {
+    <#
+    .SYNOPSIS
+        Leaves a small marker file in the script directory so users know their settings
+        have been moved to the centralized location.
+    #>
+    try {
+        $markerContent = @"
+QuodVPN settings have been moved to a centralized location.
+New location: $($script:ConfigDirectory)
+
+This file was created during automatic migration and can be safely deleted.
+Migration date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+"@
+        [System.IO.File]::WriteAllText($script:MigrationMarkerPath, $markerContent)
+    } catch {
+        # Non-critical - don't fail if we can't write the marker
     }
 }
 
@@ -678,6 +849,12 @@ function Save-Settings {
     try {
         Initialize-ProtectedData
 
+        # Ensure config directory exists before saving
+        $configDir = [System.IO.Path]::GetDirectoryName($script:SettingsFilePath)
+        if (-not (Test-Path $configDir)) {
+            New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+        }
+
         $xml = New-Object -TypeName System.Xml.XmlDocument
         $root = $xml.CreateElement("settings")
         $xml.AppendChild($root) | Out-Null
@@ -1016,7 +1193,7 @@ function Show-MainMenu {
     }
     Write-Host "2. Setup Options"
     Write-Host "O. Show Current OTP"
-    Write-Host "H. README / Help"
+    Write-Host "H. Help / README"
 
     $lastVpnDisplay = if ($script:LastVpnAddress) { $script:LastVpnAddress } else { "[None]" }
     Write-Host ("Q. Quick Connect ({0})" -f $lastVpnDisplay) -ForegroundColor Cyan
@@ -1224,128 +1401,40 @@ function Show-SetupMenu {
 
 function Show-HelpScreen {
     Clear-Host
-    $hColor = "Cyan"      # Headers
-    $tColor = "Gray"      # Text
-    $vColor = "Yellow"    # Variables/Options
-    $wColor = "Green"     # Highlights
-
-    Write-Host "================================================================" -ForegroundColor $hColor
-    Write-Host "QUOD FINANCIAL VPN CONNECTOR - USER MANUAL" -ForegroundColor White
-    Write-Host "================================================================" -ForegroundColor $hColor
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "QUOD FINANCIAL VPN CONNECTOR - HELP" -ForegroundColor White
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Version       : $SCRIPT_VERSION ($VERSION_DATE)" -ForegroundColor Gray
+    Write-Host "Config Dir    : $($script:ConfigDirectory)" -ForegroundColor Gray
+    Write-Host "Log Dir       : $($script:LogDirectory)" -ForegroundColor Gray
     Write-Host ""
 
-    # --- SECTION 1: OVERVIEW ---
-    Write-Host "1. OVERVIEW & CAPABILITIES" -ForegroundColor $hColor
-    Write-Host "--------------------------" -ForegroundColor $tColor
-    Write-Host "This tool is a secure wrapper for the Cisco Secure Client (AnyConnect)." -ForegroundColor $tColor
-    Write-Host "It automates the login process, handles Multi-Factor Authentication (OTP)," -ForegroundColor $tColor
-    Write-Host "and manages connection states without requiring manual data entry every time." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 2: SECURITY ---
-    Write-Host "2. SECURITY ARCHITECTURE" -ForegroundColor $hColor
-    Write-Host "------------------------" -ForegroundColor $tColor
-    Write-Host "A. Credential Storage (DPAPI):" -ForegroundColor $wColor
-    Write-Host "   Your VPN Password and OTP Secret are NOT stored in plain text." -ForegroundColor $tColor
-    Write-Host "   They are encrypted using Windows Data Protection API (DPAPI) with" -ForegroundColor $tColor
-    Write-Host "   'CurrentUser' scope. Only your specific Windows User Account on this" -ForegroundColor $tColor
-    Write-Host "   specific PC can decrypt them. Copied files cannot be decrypted elsewhere." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "B. Injection Security (RAM-Only):" -ForegroundColor $wColor
-    Write-Host "   Credentials are never written to a temporary file during connection." -ForegroundColor $tColor
-    Write-Host "   They are injected directly into the Cisco process memory pipe (StandardInput)," -ForegroundColor $tColor
-    Write-Host "   preventing credential leakage to disk recovery tools." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 3: OTP (MFA) ---
-    Write-Host "3. OTP & MULTI-FACTOR AUTH" -ForegroundColor $hColor
-    Write-Host "--------------------------" -ForegroundColor $tColor
-    Write-Host "The script includes a built-in TOTP (Time-based One-Time Password) generator." -ForegroundColor $tColor
-    Write-Host "If you provide your Base32 Secret Key in the Setup menu:" -ForegroundColor $tColor
-    Write-Host "   - The script automatically generates the 6-digit code during login." -ForegroundColor $tColor
-    Write-Host "   - It appends it to your password seamlessly." -ForegroundColor $tColor
-    Write-Host "   - You can view the live code via menu option [O] to use on other devices." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 4: MENU FUNCTIONS ---
-    Write-Host "4. MENU OPTIONS EXPLAINED" -ForegroundColor $hColor
-    Write-Host "-------------------------" -ForegroundColor $tColor
-    Write-Host "[1] Connect / Disconnect" -ForegroundColor $vColor
-    Write-Host "    Smart toggle. If connected, it cleanly disconnects. If disconnected," -ForegroundColor $tColor
-    Write-Host "    it prompts you to select a gateway from your saved list." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "[2] Setup Options" -ForegroundColor $vColor
-    Write-Host "    Configure your Username, Password, VPN Profile, and Gateway Addresses." -ForegroundColor $tColor
-    Write-Host "    Use this menu if your password changes or you need to add a new server." -ForegroundColor $tColor
-    Write-Host "    From this menu you can also press 'D' to create the desktop" -ForegroundColor $tColor
-    Write-Host "    shortcut with the Ctrl+Alt+V hotkey." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[O] Show Current OTP" -ForegroundColor $vColor
-    Write-Host "    Opens a live TOTP viewer that refreshes every few hundred ms so you" -ForegroundColor $tColor
-    Write-Host "    can read the current 6-digit MFA code without unlocking another app." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[H] README / Help" -ForegroundColor $vColor
-    Write-Host "    Shows this detailed help screen, including security model, menu" -ForegroundColor $tColor
-    Write-Host "    behaviour, connectivity tests, updater and version notes." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[Q] Quick Connect" -ForegroundColor $vColor
-    Write-Host "    Bypasses the server list and connects immediately to the last used" -ForegroundColor $tColor
-    Write-Host "    gateway. The main menu shows 'Quick Connect (VPN name)' where the" -ForegroundColor $tColor
-    Write-Host "    VPN name is your last endpoint, or [None] if you haven't connected yet." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[T] Connectivity Quality Test" -ForegroundColor $vColor
-    Write-Host "    Runs an on-demand quality test against all configured VPN endpoints" -ForegroundColor $tColor
-    Write-Host "    and reports a color-coded quality rating plus average latency in ms." -ForegroundColor $tColor
-    Write-Host "" 
-    Write-Host "[L] Open Logs" -ForegroundColor $vColor
-    Write-Host "    Opens the current VPN log file in your default text viewer so you" -ForegroundColor $tColor
-    Write-Host "    can quickly inspect connection history and any error messages." -ForegroundColor $tColor
-    Write-Host ""
-    # Desktop shortcut creation now lives in the Setup menu (option 2 -> 'D').
-
-    # --- SECTION 5: CONFIGURATION ---
-    Write-Host "5. CONFIGURATION DETAILS" -ForegroundColor $hColor
-    Write-Host "------------------------" -ForegroundColor $tColor
-    Write-Host "VPN Profile:" -ForegroundColor $vColor
-    Write-Host "   This must match the 'Group' name configured on the Cisco Firewall" -ForegroundColor $tColor
-    Write-Host "   (e.g., 'SaaSVPN_RD_Profile'). If this is wrong, login will fail." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "VPN Addresses:" -ForegroundColor $vColor
-    Write-Host "   A comma-separated list of your entry points (e.g., london.quod:8443)." -ForegroundColor $tColor
-    Write-Host "   You can manage this list using the List Editor in the Setup menu." -ForegroundColor $tColor
-    Write-Host ""
-
-    # --- SECTION 6: AUTO-UPDATER ---
-    Write-Host "6. AUTO-UPDATER ENGINE" -ForegroundColor $hColor
-    Write-Host "----------------------" -ForegroundColor $tColor
-    Write-Host "The application features a robust, self-healing update engine." -ForegroundColor $tColor
-    Write-Host ""
-    Write-Host "How it works:" -ForegroundColor $wColor
-    Write-Host "1. Check:" -ForegroundColor $tColor
-    Write-Host "   On launch, it checks a central OneDrive/SharePoint URL for a newer version." -ForegroundColor $tColor
-    Write-Host "2. Safe Download:" -ForegroundColor $tColor
-    Write-Host "   Downloads the update to a randomized temporary file to avoid file locks." -ForegroundColor $tColor
-    Write-Host "3. Execution Lock Bypass:" -ForegroundColor $tColor
-    Write-Host "   Since a running program cannot overwrite itself, the script spawns a" -ForegroundColor $tColor
-    Write-Host "   separate background 'Batch' process." -ForegroundColor $tColor
-    Write-Host "4. The Swap:" -ForegroundColor $tColor
-    Write-Host "   The script closes itself. The background process waits for the lock to release," -ForegroundColor $tColor
-    Write-Host "   swaps the old file for the new one, and relaunches the application." -ForegroundColor $tColor
-    Write-Host "5. Compatibility:" -ForegroundColor $tColor
-    Write-Host "   Works for both the raw PowerShell script (.ps1) and compiled executable (.exe)." -ForegroundColor $tColor
-    Write-Host ""
-    
-    # --- SECTION 7: RELEASE NOTES ---
     if (-not [string]::IsNullOrWhiteSpace($script:VERSION_NOTES)) {
-        Write-Host "7. CURRENT VERSION NOTES ($script:SCRIPT_VERSION)" -ForegroundColor $hColor
-        Write-Host "----------------------------" -ForegroundColor $tColor
-        Write-Host $script:VERSION_NOTES -ForegroundColor $wColor
+        Write-Host "CURRENT VERSION NOTES" -ForegroundColor Cyan
+        Write-Host "---------------------" -ForegroundColor Gray
+        Write-Host $script:VERSION_NOTES -ForegroundColor Green
         Write-Host ""
     }
 
-    Write-Host "Logs are located at: $script:LogDirectory" -ForegroundColor DarkGray
+    Write-Host "Full documentation (README) is available on GitHub:" -ForegroundColor Gray
+    Write-Host "  $QUOD_README_URL" -ForegroundColor Yellow
     Write-Host ""
-    Read-Host "Press Enter to return to the Main Menu"
+    Write-Host "[O] Open README in browser" -ForegroundColor Cyan
+    Write-Host "[Enter] Return to Main Menu" -ForegroundColor Gray
+    Write-Host ""
+    $helpChoice = Read-Host "Choice"
+    if ($helpChoice -ieq 'O') {
+        try {
+            Start-Process $QUOD_README_URL
+            Write-Host "Opened README in your default browser." -ForegroundColor Green
+            Start-Sleep -Seconds 1
+        } catch {
+            Write-Log "Failed to open browser: $_" -LogType "Warning"
+            Write-Host "Could not open browser. Visit the URL above manually." -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+        }
+    }
 }
 
 #endregion
@@ -1720,7 +1809,8 @@ function Invoke-VpnAddressSelection {
 #region SCRIPT ENTRYPOINT
 try
 {
-    Get-Settings 
+    Initialize-ConfigDirectory
+    Get-Settings
     
     # Check for update on start
     Test-ScriptUpdate
