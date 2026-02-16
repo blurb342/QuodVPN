@@ -215,6 +215,9 @@ function Initialize-ConfigDirectory {
         scenarios transparently.
     .DESCRIPTION
         Migration logic:
+        0. If the script is already running from the centralized location
+           (%LOCALAPPDATA%\QuodVPN), skip migration entirely - there is nothing
+           to migrate because the script directory IS the target directory.
         1. If central config dir already has settings -> use them (no migration needed).
         2. If legacy settings exist in script dir but central does not -> migrate (move files).
         3. If both locations have settings -> central wins (assumed newer); legacy files are
@@ -237,6 +240,17 @@ function Initialize-ConfigDirectory {
             $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
             return
         }
+    }
+
+    # If the script is running from the centralized config directory itself,
+    # the "legacy" paths and "central" paths are identical. No migration is
+    # needed - we are already in the target location. Comparing via
+    # GetFullPath normalizes trailing slashes and casing inconsistencies.
+    $normalizedScriptRoot  = [System.IO.Path]::GetFullPath($scriptRoot)
+    $normalizedConfigDir   = [System.IO.Path]::GetFullPath($script:ConfigDirectory)
+    if ($normalizedScriptRoot -eq $normalizedConfigDir) {
+        Write-Log "Script is running from the centralized config directory. No migration needed."
+        return
     }
 
     $centralSettingsExist = Test-Path $script:SettingsFilePath
@@ -364,6 +378,9 @@ function Initialize-LogMigration {
         Migrates log files from the legacy script-directory Logs folder to the
         centralized %LOCALAPPDATA%\QuodVPN\Logs directory.
     .DESCRIPTION
+        - Skipped entirely when the script is running from the centralized
+          location (%LOCALAPPDATA%\QuodVPN), since there is no separate legacy
+          directory to migrate from.
         - Moves archived logs (VPNConnectionLog_*.txt) to the central folder.
           If a file with the same name already exists, the incoming file is
           renamed with a _migrated suffix.
@@ -372,6 +389,12 @@ function Initialize-LogMigration {
           first) so the merged file stays chronological.
         - The legacy Logs folder is removed once empty.
     #>
+    # If the script directory IS the centralized config directory, the legacy
+    # log path points inside the target location - nothing to migrate.
+    $normalizedScriptRoot = [System.IO.Path]::GetFullPath($scriptRoot)
+    $normalizedConfigDir  = [System.IO.Path]::GetFullPath($script:ConfigDirectory)
+    if ($normalizedScriptRoot -eq $normalizedConfigDir) { return }
+
     if (-not (Test-Path $script:LegacyLogDirectory)) { return }
 
     # Only migrate if the legacy dir actually contains files
