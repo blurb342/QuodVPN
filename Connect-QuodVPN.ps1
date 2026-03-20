@@ -1602,6 +1602,7 @@ function Invoke-ElevatedKill {
     )
 
     # First attempt: normal privileged kill
+    $needsElevation = $false
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
         Start-Sleep -Milliseconds 300
@@ -1621,7 +1622,12 @@ function Invoke-ElevatedKill {
 
         Write-Log "Access denied killing $Label PID=$ProcessId — requesting elevated privileges via UAC." -LogType "Warning"
         Write-Host "  Access denied. Requesting elevated privileges (UAC prompt may appear)..." -ForegroundColor Yellow
+        $needsElevation = $true
+    }
 
+    # Second attempt: elevated kill via UAC — kept outside the catch block above
+    # because PowerShell 5.1 does not allow nested try/catch inside a catch block.
+    if ($needsElevation) {
         try {
             $psArgs = "-NonInteractive -WindowStyle Hidden -Command `"Stop-Process -Id $ProcessId -Force`""
             $elevatedProc = Start-Process -FilePath "powershell.exe" `
