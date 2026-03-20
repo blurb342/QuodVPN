@@ -5,24 +5,6 @@
 .DESCRIPTION
     PowerShell script to manage Cisco VPN connections.
     
-    Update 5.32 (2026-03-20):
-    - Fix: Resolved PowerShell 5.1 parser error ("Catch block must be the last
-        catch block") caused by a nested try/catch inside the catch block of
-        Invoke-ElevatedKill. Refactored to use a $needsElevation flag so the
-        elevated-kill try/catch runs at function scope.
-
-    Update 5.31 (2026-03-20):
-    - Fix: Kill / Kill-All QuodFrontEnd now detects Access Denied and re-attempts
-        via an elevated PowerShell subprocess (UAC prompt) so processes owned by
-        a different session or with higher privileges can still be terminated.
-    - Fix: Process termination is verified after both the normal and elevated paths;
-        failures are logged and surfaced to the user with a clear error message.
-
-    Update 5.30 (2026-02-12):
-    - Auto-Update: Now uses GitHub API to detect updates by commit SHA.
-      No manual version bumping required - any commit triggers update.
-    - Auto-Update: Shows latest commit message and date when update available.
-
     Update 5.29 (2026-02-12):
     - Auto-Update: Now uses GitHub API to detect updates by commit SHA.
       No manual version bumping required - any commit triggers update.
@@ -73,7 +55,7 @@
 
 .NOTES
     Original Author: Medan Gabbay
-    Updated: 2026-03-20
+    Updated: 2026-02-12
 #>
 param (
     [string]$VpnName,
@@ -95,15 +77,16 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.32"
-$VERSION_DATE   = "20MAR26"
+$SCRIPT_VERSION = "5.30"
+$VERSION_DATE   = "12FEB26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
-- Kill: Access Denied when terminating QuodFrontEnd now triggers a UAC elevation
-  prompt so the kill is retried with admin rights, rather than silently failing.
-- Fix: Resolved PowerShell 5.1 parser error caused by nested try/catch inside a
-  catch block in the elevated-kill helper.
+- Config: Settings, credentials, and logs now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
+- Config: Script can be moved or updated without losing settings or log history.
+- Help: README / Help screen now links to the online GitHub README.
+- Auto-Update: Git-native updates via GitHub API (no manual version bumping).
+- Auto-Update: Shows commit message and date when update is available.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
@@ -1326,23 +1309,35 @@ function Show-MainMenu {
             $killIdx = [int]$matches[1] - 1
             if ($killIdx -ge 0 -and $killIdx -lt $quodProcs.Count) {
                 $procToKill = $quodProcs[$killIdx]
-                Write-Log "User requested kill of QuodFrontEnd index $($killIdx + 1): PID=$($procToKill.Id), Name=$($procToKill.ProcessName), Title='$($procToKill.MainWindowTitle)'"
-                $killed = Invoke-ElevatedKill -ProcessId $procToKill.Id -Label "QuodFrontEnd"
-                if ($killed) {
-                    Write-Log "Successfully terminated QuodFrontEnd process PID=$($procToKill.Id)."
-                } else {
-                    Write-Host "Error: could not terminate PID $($procToKill.Id). See VPN log for details." -ForegroundColor Red
+                try {
+                    Write-Log "User requested kill of QuodFrontEnd index $($killIdx + 1): PID=$($procToKill.Id), Name=$($procToKill.ProcessName), Title='$($procToKill.MainWindowTitle)'"
+                    Stop-Process -Id $procToKill.Id -Force -ErrorAction Stop
+                    Start-Sleep -Milliseconds 300
+                    if (Get-Process -Id $procToKill.Id -ErrorAction SilentlyContinue) {
+                        Write-Log "WARNING: Process still running after Stop-Process: PID=$($procToKill.Id)" -LogType "Warning"
+                        Write-Host "Warning: process appears to still be running (PID $($procToKill.Id))." -ForegroundColor Yellow
+                    } else {
+                        Write-Log "Successfully terminated QuodFrontEnd process PID=$($procToKill.Id)."
+                    }
+                } catch {
+                    Write-Log "Failed to kill QuodFrontEnd process PID=$($procToKill.Id): $_" -LogType "Error"
+                    Write-Host "Error killing process PID $($procToKill.Id). See VPN log for details." -ForegroundColor Red
                     Start-Sleep -Seconds 2
                 }
             }
         } elseif ($userInput -ieq "K") {
             foreach ($proc in $quodProcs) {
-                Write-Log "User requested kill-all of QuodFrontEnd: PID=$($proc.Id), Name=$($proc.ProcessName), Title='$($proc.MainWindowTitle)'"
-                $killed = Invoke-ElevatedKill -ProcessId $proc.Id -Label "QuodFrontEnd (kill-all)"
-                if ($killed) {
-                    Write-Log "Successfully terminated QuodFrontEnd (kill-all) PID=$($proc.Id)."
-                } else {
-                    Write-Log "Failed to terminate QuodFrontEnd (kill-all) PID=$($proc.Id)." -LogType "Error"
+                try {
+                    Write-Log "User requested kill-all of QuodFrontEnd: PID=$($proc.Id), Name=$($proc.ProcessName), Title='$($proc.MainWindowTitle)'"
+                    Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                    Start-Sleep -Milliseconds 100
+                    if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
+                        Write-Log "WARNING: Process still running after Stop-Process (kill-all): PID=$($proc.Id)" -LogType "Warning"
+                    } else {
+                        Write-Log "Successfully terminated QuodFrontEnd (kill-all) PID=$($proc.Id)."
+                    }
+                } catch {
+                    Write-Log "Failed to kill QuodFrontEnd (kill-all) PID=$($proc.Id): $_" -LogType "Error"
                 }
             }
         }
@@ -1598,73 +1593,6 @@ function New-Otp {
         }
         $plainSecret = $null
     }
-}
-
-# Attempts to stop a process by PID. If Access Denied, re-attempts via an
-# elevated (UAC) PowerShell subprocess so the user is prompted for admin rights.
-# Returns $true on confirmed termination, $false otherwise.
-function Invoke-ElevatedKill {
-    param(
-        [Parameter(Mandatory)][int]$ProcessId,
-        [string]$Label = "process"
-    )
-
-    # First attempt: normal privileged kill
-    $needsElevation = $false
-    try {
-        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
-        Start-Sleep -Milliseconds 300
-        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-            return $true
-        }
-    } catch {
-        $errMsg = $_.Exception.Message
-        $isAccessDenied = $errMsg -match "Access is denied" -or
-                          $_.Exception.HResult -eq [int]0x80070005 -or
-                          $_.CategoryInfo.Category -eq 'PermissionDenied'
-
-        if (-not $isAccessDenied) {
-            Write-Log "Failed to kill $Label PID=$ProcessId (non-access error): $errMsg" -LogType "Error"
-            return $false
-        }
-
-        Write-Log "Access denied killing $Label PID=$ProcessId — requesting elevated privileges via UAC." -LogType "Warning"
-        Write-Host "  Access denied. Requesting elevated privileges (UAC prompt may appear)..." -ForegroundColor Yellow
-        $needsElevation = $true
-    }
-
-    # Second attempt: elevated kill via UAC — kept outside the catch block above
-    # because PowerShell 5.1 does not allow nested try/catch inside a catch block.
-    if ($needsElevation) {
-        try {
-            $psArgs = "-NonInteractive -WindowStyle Hidden -Command `"Stop-Process -Id $ProcessId -Force`""
-            $elevatedProc = Start-Process -FilePath "powershell.exe" `
-                                          -ArgumentList $psArgs `
-                                          -Verb RunAs `
-                                          -PassThru `
-                                          -ErrorAction Stop
-            # Wait up to 30 s for the user to accept/decline the UAC prompt
-            $elevated = $elevatedProc.WaitForExit(30000)
-            if (-not $elevated) {
-                $elevatedProc.Kill()
-                Write-Log "Elevated kill of $Label PID=$ProcessId timed out (UAC not responded)." -LogType "Warning"
-                Write-Host "  Timed out waiting for UAC response." -ForegroundColor Red
-                return $false
-            }
-        } catch {
-            Write-Log "Failed to launch elevated kill for $Label PID=$ProcessId : $_" -LogType "Error"
-            Write-Host "  Could not request elevation: $_" -ForegroundColor Red
-            return $false
-        }
-    }
-
-    # Verify the process is gone (covers both the normal and elevated paths)
-    Start-Sleep -Milliseconds 500
-    if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
-        Write-Log "WARNING: $Label PID=$ProcessId still running after kill attempt." -LogType "Warning"
-        return $false
-    }
-    return $true
 }
 
 function Stop-VpnUi {
