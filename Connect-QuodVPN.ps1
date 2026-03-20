@@ -1625,7 +1625,7 @@ function Invoke-ElevatedKill {
     # Second attempt: re-try via elevated subprocess (UAC prompt)
     # Kept outside the catch block above for PS 5.1 compatibility (no nested try/catch in catch).
     if ($needsElevation) {
-        Write-Log "Access denied killing $Label PID=$ProcessId — requesting elevated privileges via UAC." -LogType "Warning"
+        Write-Log "Access denied killing $Label PID=$ProcessId - requesting elevated privileges via UAC." -LogType "Warning"
         Write-Host "  Access denied. Requesting elevated privileges (UAC prompt may appear)..." -ForegroundColor Yellow
 
         try {
