@@ -67,7 +67,7 @@
 
 .NOTES
     Original Author: Medan Gabbay
-    Updated: 2026-03-20
+    Updated: 2026-03-20 (v5.31)
 #>
 param (
     [string]$VpnName,
