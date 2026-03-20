@@ -5,6 +5,12 @@
 .DESCRIPTION
     PowerShell script to manage Cisco VPN connections.
     
+    Update 5.32 (2026-03-20):
+    - Fix: Resolved PowerShell 5.1 parser error ("Catch block must be the last
+        catch block") caused by a nested try/catch inside the catch block of
+        Invoke-ElevatedKill. Refactored to use a $needsElevation flag so the
+        elevated-kill try/catch runs at function scope.
+
     Update 5.31 (2026-03-20):
     - Fix: Kill / Kill-All QuodFrontEnd now detects Access Denied and re-attempts
         via an elevated PowerShell subprocess (UAC prompt) so processes owned by
@@ -89,13 +95,15 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.31"
+$SCRIPT_VERSION = "5.32"
 $VERSION_DATE   = "20MAR26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
 - Kill: Access Denied when terminating QuodFrontEnd now triggers a UAC elevation
   prompt so the kill is retried with admin rights, rather than silently failing.
+- Fix: Resolved PowerShell 5.1 parser error caused by nested try/catch inside a
+  catch block in the elevated-kill helper.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
