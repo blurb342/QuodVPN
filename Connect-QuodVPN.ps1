@@ -5,6 +5,18 @@
 .DESCRIPTION
     PowerShell script to manage Cisco VPN connections.
     
+    Update 5.31 (2026-03-20):
+    - Fix: Kill / Kill-All QuodFrontEnd now detects Access Denied and re-attempts
+        via an elevated PowerShell subprocess (UAC prompt) so processes owned by
+        a different session or with higher privileges can still be terminated.
+    - Fix: Process termination is verified after both the normal and elevated paths;
+        failures are logged and surfaced to the user with a clear error message.
+
+    Update 5.30 (2026-02-12):
+    - Auto-Update: Now uses GitHub API to detect updates by commit SHA.
+      No manual version bumping required - any commit triggers update.
+    - Auto-Update: Shows latest commit message and date when update available.
+
     Update 5.29 (2026-02-12):
     - Auto-Update: Now uses GitHub API to detect updates by commit SHA.
       No manual version bumping required - any commit triggers update.
@@ -55,7 +67,7 @@
 
 .NOTES
     Original Author: Medan Gabbay
-    Updated: 2026-02-12
+    Updated: 2026-03-20
 #>
 param (
     [string]$VpnName,
@@ -77,16 +89,13 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.30"
-$VERSION_DATE   = "12FEB26"
+$SCRIPT_VERSION = "5.31"
+$VERSION_DATE   = "20MAR26"
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
-- Config: Settings, credentials, and logs now stored in %LOCALAPPDATA%\QuodVPN (auto-migrated).
-- Config: Script can be moved or updated without losing settings or log history.
-- Help: README / Help screen now links to the online GitHub README.
-- Auto-Update: Git-native updates via GitHub API (no manual version bumping).
-- Auto-Update: Shows commit message and date when update is available.
+- Kill: Access Denied when terminating QuodFrontEnd now triggers a UAC elevation
+  prompt so the kill is retried with admin rights, rather than silently failing.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
