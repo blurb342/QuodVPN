@@ -92,6 +92,11 @@ param (
 $SCRIPT_VERSION = "5.31"
 $VERSION_DATE   = "20MAR26"
 
+# --- TIMEOUT CONSTANTS ---
+# These govern internal subprocess waits and are not exposed as script parameters.
+$VPN_STATE_QUERY_TIMEOUT_MS = 8000   # Max wait for vpncli to report connection state
+$UAC_ELEVATION_TIMEOUT_MS   = 30000  # Max wait for user to accept or decline a UAC prompt
+
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
 - Kill: Access Denied when terminating QuodFrontEnd now triggers a UAC elevation
@@ -180,6 +185,8 @@ $script:MaxLogSizeBytes = $MaxLogSizeMB * 1MB
 $script:LastUserLogMessage   = $null
 $script:LastUserLogType      = $null
 $script:LastUserLogTimestamp = $null
+$script:LastOtpError         = $null    # Set by New-Otp on failure; callers read for display
+$script:UsingLegacyConfigPaths = $false # Set when Initialize-ConfigDirectory falls back to script dir
 
 function Write-Log {
     param(
@@ -247,6 +254,7 @@ function Initialize-ConfigDirectory {
             Write-Log "Falling back to script directory for settings." -LogType "Warning"
             $script:SettingsFilePath = $script:LegacySettingsFilePath
             $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            $script:UsingLegacyConfigPaths = $true
             return
         }
     }
@@ -345,6 +353,7 @@ function Initialize-ConfigDirectory {
                 Write-Log "Migration verification failed. Keeping legacy settings." -LogType "Error"
                 $script:SettingsFilePath = $script:LegacySettingsFilePath
                 $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+                $script:UsingLegacyConfigPaths = $true
             }
         } else {
             # Migration failed - fall back to legacy paths
@@ -353,6 +362,7 @@ function Initialize-ConfigDirectory {
             Write-Host ""
             $script:SettingsFilePath = $script:LegacySettingsFilePath
             $script:SecureSettingsFilePath = $script:LegacySecureSettingsFilePath
+            $script:UsingLegacyConfigPaths = $true
         }
         return
     }
@@ -766,9 +776,9 @@ function Get-VpnCliConnectionStatus {
         # output buffer fills (process blocks on write until buffer is drained).
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 
-        if (-not $process.WaitForExit(8000)) {
+        if (-not $process.WaitForExit($VPN_STATE_QUERY_TIMEOUT_MS)) {
             try { $process.Kill() } catch {}
-            Write-Log "vpncli state timed out after 8000ms" -LogType "Warning"
+            Write-Log "vpncli state timed out after ${VPN_STATE_QUERY_TIMEOUT_MS}ms" -LogType "Warning"
             return "Unknown"
         }
 
@@ -1263,6 +1273,12 @@ function Show-MainMenu {
     Write-Host $boxLine -ForegroundColor Cyan
     Write-Host "" 
 
+    # --- Config path warning (persistent; shown every refresh until resolved) ---
+    if ($script:UsingLegacyConfigPaths) {
+        Write-Host "Warning: Config stored in script directory (central path unavailable) -- check log for details." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
     # --- Errors / Warnings (below connectivity box for more room) ---
     if ($recentAlert) {
         Write-Host "Errors / Warnings" -ForegroundColor Yellow
@@ -1375,11 +1391,25 @@ function Read-EditField {
 
 # --- NEW LIST EDITOR MENU (Parses CSV into manageable items) ---
 function Read-EditList {
-    param([string]$Name, [string[]]$CurrentItems)
-    
+    param(
+        [string]$Name,
+        [string[]]$CurrentItems,
+        [scriptblock]$Transform = $null,
+        [scriptblock]$Validate  = $null
+    )
+
     # Convert to ArrayList for easy adding/removing
     $list = New-Object System.Collections.ArrayList
     if ($CurrentItems) { $list.AddRange($CurrentItems) }
+
+    # Apply optional transform then validation; returns $null if the item should be rejected
+    $NormalizeItem = {
+        param([string]$raw)
+        $val = $raw.Trim()
+        if ($Transform) { $val = (& $Transform $val) }
+        if ($Validate -and -not (& $Validate $val)) { return $null }
+        return $val
+    }
 
     while ($true) {
         Clear-Host
@@ -1408,7 +1438,13 @@ function Read-EditList {
             "^A$" { # ADD
                 $newItem = Read-Host "Enter new item"
                 if (-not [string]::IsNullOrWhiteSpace($newItem)) {
-                    [void]$list.Add($newItem.Trim())
+                    $normalized = & $NormalizeItem $newItem
+                    if ($null -eq $normalized) {
+                        Write-Host "Invalid format. Expected: hostname or hostname:port (e.g. vpn.example.com:443)" -ForegroundColor Red
+                        Start-Sleep -Milliseconds 1200
+                    } else {
+                        [void]$list.Add($normalized)
+                    }
                 }
             }
             "^D$" { # DELETE
@@ -1429,7 +1465,13 @@ function Read-EditList {
                     Write-Host "Editing: $($list[$idx])" -ForegroundColor Cyan
                     $editVal = Read-Host "Enter new value (or Enter to keep)"
                     if (-not [string]::IsNullOrWhiteSpace($editVal)) {
-                        $list[$idx] = $editVal.Trim()
+                        $normalized = & $NormalizeItem $editVal
+                        if ($null -eq $normalized) {
+                            Write-Host "Invalid format. Expected: hostname or hostname:port (e.g. vpn.example.com:443)" -ForegroundColor Red
+                            Start-Sleep -Milliseconds 1200
+                        } else {
+                            $list[$idx] = $normalized
+                        }
                     }
                 }
             }
@@ -1488,7 +1530,20 @@ function Show-SetupMenu {
             }
             "5" { $script:CiscoVpnCliPath = Read-EditField -Prompt "Cisco VPN CLI Path" -CurrentValue $script:CiscoVpnCliPath }
             "6" { $script:CiscoVpnUiPath = Read-EditField -Prompt "Cisco VPN UI Path" -CurrentValue $script:CiscoVpnUiPath }
-            "7" { $script:VpnAddresses = Read-EditList -Name "VPN Addresses" -CurrentItems $script:VpnAddresses }
+            "7" {
+                $vpnTransform = {
+                    param($v)
+                    $v = $v -replace '^https?://', ''   # strip http:// or https://
+                    $v = ($v -split '/')[0]              # strip any path component
+                    return $v
+                }
+                $vpnValidate = {
+                    param($v)
+                    return $v -match '^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?(:\d{1,5})?$'
+                }
+                $script:VpnAddresses = Read-EditList -Name "VPN Addresses" -CurrentItems $script:VpnAddresses `
+                    -Transform $vpnTransform -Validate $vpnValidate
+            }
             "8" { $script:QuodDnsSuffixes = Read-EditList -Name "DNS Suffixes" -CurrentItems $script:QuodDnsSuffixes }
             "D" { New-DesktopShortcut }
         }
@@ -1556,7 +1611,11 @@ function New-Otp {
     param(
         [Parameter(Mandatory=$false)]$Secret
     )
-    if (-not $Secret) { return "" }
+    $script:LastOtpError = $null
+    if (-not $Secret) {
+        $script:LastOtpError = "No OTP secret configured. Add one in Setup (option 4)."
+        return $null
+    }
 
     $plainSecret = $null
     $bstrPtr = [IntPtr]::Zero
@@ -1582,6 +1641,14 @@ function New-Otp {
         $binaryCode = ((($hash[$offset] -band 0x7F) -shl 24) -bor (($hash[$offset+1] -band 0xFF) -shl 16) -bor (($hash[$offset+2] -band 0xFF) -shl 8) -bor (($hash[$offset+3] -band 0xFF)))
         return ($binaryCode % 1000000).ToString("D6")
     } catch {
+        $msg = $_.Exception.Message
+        if ($msg -like "Invalid Base32 character*") {
+            $script:LastOtpError = "OTP secret has an invalid character ($msg). Re-enter your Base32 secret in Setup."
+        } elseif ($msg -like "*BSTR*" -or $msg -like "*Marshal*" -or $msg -like "*SecureString*") {
+            $script:LastOtpError = "Failed to decrypt OTP secret (DPAPI error). Try re-entering the secret in Setup."
+        } else {
+            $script:LastOtpError = "OTP generation failed: $msg"
+        }
         Write-Log "OTP generation failed: $_" -LogType "Error"
         return $null
     } finally {
@@ -1636,7 +1703,7 @@ function Invoke-ElevatedKill {
                                           -PassThru `
                                           -ErrorAction Stop
             # Wait up to 30 s for the user to accept/decline the UAC prompt
-            $elevated = $elevatedProc.WaitForExit(30000)
+            $elevated = $elevatedProc.WaitForExit($UAC_ELEVATION_TIMEOUT_MS)
             if (-not $elevated) {
                 $elevatedProc.Kill()
                 Write-Log "Elevated kill of $Label PID=$ProcessId timed out (UAC not responded)." -LogType "Warning"
@@ -1728,8 +1795,9 @@ function Connect-Vpn {
         if ($script:OtpSecret) {
             $otp = New-Otp -Secret $script:OtpSecret
             if ($null -eq $otp) {
-                Write-Host "OTP generation failed. Check your OTP secret in Setup." -ForegroundColor Red
-                Write-Log "Aborting connection: OTP generation returned null (invalid secret?)." -LogType "Error"
+                $errDetail = if ($script:LastOtpError) { $script:LastOtpError } else { "Check your OTP secret in Setup." }
+                Write-Host "OTP error: $errDetail" -ForegroundColor Red
+                Write-Log "Aborting connection: OTP generation returned null." -LogType "Error"
                 return $false
             }
             $otp = $otp.Trim()
@@ -1803,16 +1871,35 @@ function Connect-Vpn {
             $profileNumber = 1
         }
         else {
-            $matchedProfile = $profileMapping.Keys | Where-Object { $_ -like "*$($script:VpnProfile)*" } | Select-Object -First 1
-            
-            if (-not $matchedProfile) {
-                if ($profileMapping.Count -eq 1) {
-                    $matchedProfile = $profileMapping.Keys | Select-Object -First 1
-                    Write-Log "Profile name mismatch, but only 1 profile available. Using: $matchedProfile" -LogType "Warning"
-                } else {
-                    Write-Host "No matching VPN profile found for '$($script:VpnProfile)'." -ForegroundColor Red
-                    Write-Host "Available profiles: $($profileMapping.Keys -join ', ')" -ForegroundColor Yellow
+            # Step 1: exact match (case-insensitive)
+            $exactMatch = $profileMapping.Keys | Where-Object { $_ -ieq $script:VpnProfile } | Select-Object -First 1
+
+            if ($exactMatch) {
+                $matchedProfile = $exactMatch
+                Write-Log "Profile exact match: $matchedProfile"
+            } else {
+                # Step 2: contains-wildcard fallback
+                $wildcardMatches = @($profileMapping.Keys | Where-Object { $_ -like "*$($script:VpnProfile)*" })
+
+                if ($wildcardMatches.Count -eq 1) {
+                    $matchedProfile = $wildcardMatches[0]
+                    Write-Log "Profile fuzzy match: '$($script:VpnProfile)' -> '$matchedProfile'" -LogType "Warning"
+                } elseif ($wildcardMatches.Count -gt 1) {
+                    Write-Host "Ambiguous profile: '$($script:VpnProfile)' matches multiple profiles:" -ForegroundColor Yellow
+                    $wildcardMatches | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+                    Write-Host "Update the VPN Profile in Setup to an exact name from the list above." -ForegroundColor Yellow
+                    Write-Log "Ambiguous profile '$($script:VpnProfile)' matches: $($wildcardMatches -join ', ')" -LogType "Warning"
                     return $false
+                } else {
+                    # No match at all
+                    if ($profileMapping.Count -eq 1) {
+                        $matchedProfile = $profileMapping.Keys | Select-Object -First 1
+                        Write-Log "Profile name mismatch, but only 1 profile available. Using: $matchedProfile" -LogType "Warning"
+                    } else {
+                        Write-Host "No matching VPN profile found for '$($script:VpnProfile)'." -ForegroundColor Red
+                        Write-Host "Available profiles: $($profileMapping.Keys -join ', ')" -ForegroundColor Yellow
+                        return $false
+                    }
                 }
             }
             $profileNumber = $profileMapping[$matchedProfile]
@@ -1917,7 +2004,8 @@ function Show-OtpScreen {
     # Verify OTP generation works before entering loop
     $testOtp = New-Otp -Secret $script:OtpSecret
     if ($null -eq $testOtp) {
-        Write-Host "OTP generation failed. Your OTP secret may be invalid." -ForegroundColor Red
+        $errDetail = if ($script:LastOtpError) { $script:LastOtpError } else { "Your OTP secret may be invalid." }
+        Write-Host "OTP error: $errDetail" -ForegroundColor Red
         Read-Host "Press Enter to return"
         return
     }
@@ -1930,7 +2018,13 @@ function Show-OtpScreen {
 
     while ($true) {
         $otp = New-Otp -Secret $script:OtpSecret
-        if ($null -eq $otp) { $otp = "ERROR" }
+        if ($null -eq $otp) {
+            Write-Host ""
+            $errDetail = if ($script:LastOtpError) { $script:LastOtpError } else { "OTP generation failed." }
+            Write-Host "OTP error: $errDetail" -ForegroundColor Red
+            Read-Host "Press Enter to return"
+            return
+        }
         $epoch = [DateTime]::UtcNow - (Get-Date "1970-01-01Z")
         $seconds = [math]::Floor($epoch.TotalSeconds)
         $remain = 30 - ($seconds % 30)

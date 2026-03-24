@@ -130,8 +130,8 @@ All parameters are optional. Settings from the config file take precedence after
 | `CiscoVpnUiPath` | string | Auto-detected | Path to `csc_ui.exe` |
 | `LogDirectory` | string | `<script>\Logs` | Log output directory |
 | `MaxLogSizeMB` | int | 5 | Log rotation threshold in MB |
-| `VpnQueryTimeoutMs` | int | 10000 | Timeout for VPN profile query (1000-120000) |
-| `VpnConnectTimeoutMs` | int | 25000 | Timeout for VPN handshake (1000-120000) |
+| `VpnQueryTimeoutMs` | int | 10000 | Milliseconds to wait for `vpncli` to return the available VPN profiles. Valid range: 1000–120000. Increase on high-latency or slow networks. |
+| `VpnConnectTimeoutMs` | int | 25000 | Milliseconds to wait for the full VPN authentication handshake to complete. Valid range: 1000–120000. Increase if connections time out on congested networks. |
 
 ## Security Architecture
 
