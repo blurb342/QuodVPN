@@ -107,9 +107,11 @@ $script:VERSION_NOTES = @"
 - Main menu shows a persistent warning when config falls back to the script directory.
 
 5.33:
-- Arrow-key navigation in main menu (use arrow keys to move, Enter to select).
-- ANSI reverse-video highlight on Windows Terminal / modern console; plain > prefix on legacy.
-- Arrow-key selection in VPN address picker replaces numbered Read-Host prompt.
+- Arrow-key navigation in main menu, Setup menu, and VPN address / DNS suffix list editors.
+- ANSI reverse-video highlight on Windows Terminal; Yellow text highlight on legacy terminals.
+- Arrow-key VPN address picker replaces numbered Read-Host prompt.
+- Connectivity quality test cancellable mid-run with Enter or Esc (between tests).
+- Buffered keystrokes from submenus no longer re-trigger main menu actions on return.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
@@ -198,9 +200,10 @@ $script:LastOtpError         = $null    # Set by New-Otp on failure; callers rea
 $script:UsingLegacyConfigPaths = $false # Set when Initialize-ConfigDirectory falls back to script dir
 
 # Arrow-key navigation state
-$script:MenuSelectedIndex = 0
-$script:AnsiSupported     = $false
-$script:ESC               = [char]27
+$script:MenuSelectedIndex  = 0
+$script:SetupSelectedIndex = 0
+$script:AnsiSupported      = $false
+$script:ESC                = [char]27
 
 function Write-Log {
     param(
@@ -1356,13 +1359,23 @@ function Show-MainMenu {
 
     # Draw menu items with arrow-cursor indicator
     for ($i = 0; $i -lt $menuItems.Count; $i++) {
-        $item = $menuItems[$i]
-        $line = Format-MenuItem -Label $item.Label -IsSelected ($i -eq $script:MenuSelectedIndex)
-        Write-Host $line -ForegroundColor $item.Color
+        $item  = $menuItems[$i]
+        $isSel = ($i -eq $script:MenuSelectedIndex)
+        $line  = Format-MenuItem -Label $item.Label -IsSelected $isSel
+        if ($isSel -and $script:AnsiSupported) {
+            Write-Host $line                               # ANSI reverse-video handles highlight
+        } elseif ($isSel) {
+            Write-Host $line -ForegroundColor Yellow       # non-ANSI fallback: bright yellow
+        } else {
+            Write-Host $line -ForegroundColor $item.Color
+        }
     }
     Write-Host ""
     Write-Host "  Use arrow keys to navigate or type a shortcut" -ForegroundColor DarkGray
     Write-Host ""
+
+    # Drain keystrokes queued during submenus/actions so they don't fire immediately
+    while ([System.Console]::KeyAvailable) { [void][System.Console]::ReadKey($true) }
 
     # Key-input loop: arrows navigate, Enter confirms, chars are legacy typed shortcuts
     while ($true) {
@@ -1505,30 +1518,67 @@ function Read-EditList {
         return $val
     }
 
+    $listSelIdx = 0
+
     while ($true) {
         Clear-Host
         Write-Host "--- EDIT LIST: $Name ---" -ForegroundColor Cyan
-        
-        # Display Indexed List
+
+        # Clamp selection index
+        if ($list.Count -gt 0 -and $listSelIdx -ge $list.Count) { $listSelIdx = $list.Count - 1 }
+        if ($listSelIdx -lt 0) { $listSelIdx = 0 }
+
+        # Display list with arrow-key cursor
         if ($list.Count -gt 0) {
             for ($i = 0; $i -lt $list.Count; $i++) {
-                Write-Host ("  {0}. {1}" -f ($i + 1), $list[$i]) -ForegroundColor White
+                $isSel = ($i -eq $listSelIdx)
+                $label = "{0}. {1}" -f ($i + 1), $list[$i]
+                $line  = Format-MenuItem -Label $label -IsSelected $isSel
+                if ($isSel -and $script:AnsiSupported) { Write-Host $line }
+                elseif ($isSel)                         { Write-Host $line -ForegroundColor Yellow }
+                else                                    { Write-Host $line -ForegroundColor White }
             }
         } else {
             Write-Host "  [List is Empty]" -ForegroundColor DarkGray
         }
 
-        Write-Host "`nActions:" -ForegroundColor Yellow
-        Write-Host "[#] Edit Item (Enter number)"
-        Write-Host "[A] Add New Item"
-        Write-Host "[D] Delete Item"
-        Write-Host "[S] Save & Return"
-        Write-Host "[C] Cancel (Discard Changes)"
         Write-Host ""
-        
-        $userChoice = Read-Host "Choose action"
-        
+        Write-Host "  Arrow keys select  |  Enter=Edit  D=Delete  A=Add  S=Save  C=Cancel" -ForegroundColor DarkGray
+        Write-Host ""
+
+        # Drain buffer then read one key
+        while ([System.Console]::KeyAvailable) { [void][System.Console]::ReadKey($true) }
+        $userChoice = $null
+        while ($null -eq $userChoice) {
+            if (-not [System.Console]::KeyAvailable) { Start-Sleep -Milliseconds 100; continue }
+            $k = [System.Console]::ReadKey($true)
+            if ($k.Key -eq [ConsoleKey]::UpArrow) {
+                $listSelIdx = [Math]::Max(0, $listSelIdx - 1); $userChoice = 'REDRAW'
+            } elseif ($k.Key -eq [ConsoleKey]::DownArrow) {
+                $listSelIdx = [Math]::Min([Math]::Max(0, $list.Count - 1), $listSelIdx + 1); $userChoice = 'REDRAW'
+            } elseif ($k.Key -eq [ConsoleKey]::Enter -and $list.Count -gt 0) {
+                $userChoice = 'EDIT_SEL'
+            } elseif ($k.KeyChar -ne [char]0) {
+                $userChoice = ([string]$k.KeyChar).ToUpper()
+            }
+        }
+        if ($userChoice -eq 'REDRAW') { continue }
+
         switch -Regex ($userChoice) {
+            "^EDIT_SEL$" { # EDIT via Enter key on highlighted item
+                $idx = $listSelIdx
+                Write-Host "Editing: $($list[$idx])" -ForegroundColor Cyan
+                $editVal = Read-Host "Enter new value (or Enter to keep)"
+                if (-not [string]::IsNullOrWhiteSpace($editVal)) {
+                    $normalized = & $NormalizeItem $editVal
+                    if ($null -eq $normalized) {
+                        Write-Host "Invalid format. Expected: hostname or hostname:port (e.g. vpn.example.com:443)" -ForegroundColor Red
+                        Start-Sleep -Milliseconds 1200
+                    } else {
+                        $list[$idx] = $normalized
+                    }
+                }
+            }
             "^A$" { # ADD
                 $newItem = Read-Host "Enter new item"
                 if (-not [string]::IsNullOrWhiteSpace($newItem)) {
@@ -1538,24 +1588,23 @@ function Read-EditList {
                         Start-Sleep -Milliseconds 1200
                     } else {
                         [void]$list.Add($normalized)
+                        $listSelIdx = $list.Count - 1   # move cursor to new item
                     }
                 }
             }
-            "^D$" { # DELETE
-                $delIdx = Read-Host "Enter number to delete"
-                if ($delIdx -match '^\d+$') {
-                    $idx = [int]$delIdx - 1
-                    if ($idx -ge 0 -and $idx -lt $list.Count) {
-                        $removed = $list[$idx]
-                        $list.RemoveAt($idx)
-                        Write-Host "Removed: $removed" -ForegroundColor Red
-                        Start-Sleep -Milliseconds 800
-                    }
+            "^D$" { # DELETE highlighted item
+                if ($list.Count -gt 0) {
+                    $removed = $list[$listSelIdx]
+                    $list.RemoveAt($listSelIdx)
+                    if ($listSelIdx -ge $list.Count -and $listSelIdx -gt 0) { $listSelIdx-- }
+                    Write-Host "Removed: $removed" -ForegroundColor Red
+                    Start-Sleep -Milliseconds 800
                 }
             }
-            "^\d+$" { # EDIT EXISTING
+            "^\d+$" { # EDIT via typed number (legacy shortcut)
                 $idx = [int]$userChoice - 1
                 if ($idx -ge 0 -and $idx -lt $list.Count) {
+                    $listSelIdx = $idx
                     Write-Host "Editing: $($list[$idx])" -ForegroundColor Cyan
                     $editVal = Read-Host "Enter new value (or Enter to keep)"
                     if (-not [string]::IsNullOrWhiteSpace($editVal)) {
@@ -1581,37 +1630,68 @@ function Read-EditList {
 # ------------------------------
 
 function Show-SetupMenu {
-    $exitSetupMenu = $false
-    while (-not $exitSetupMenu) {
+    while ($true) {
         Clear-Host
         Write-Host "VPN Setup Menu" -ForegroundColor Yellow
         Write-Host "--------------"
-        Write-Host ("1. Set VPN Username            : [{0}]" -f ($script:VpnUsername))
-        Write-Host ("2. Set VPN Password            : [{0}]" -f $(if ($script:VpnPassword) {"Stored Securely"} else {"Not Set"}))
-        Write-Host ("3. Set VPN Profile             : [{0}]" -f ($script:VpnProfile))
-        Write-Host ("4. Set OTP Secret              : [{0}]" -f $(if ($script:OtpSecret) {"Stored Securely"} else {"Not Set"}))
-        Write-Host ("5. Set Cisco VPN CLI Path      : [{0}]" -f ($script:CiscoVpnCliPath))
-        Write-Host ("6. Set Cisco VPN UI Path       : [{0}]" -f ($script:CiscoVpnUiPath))
-        Write-Host (Format-ListDisplay -Label "7. Set VPN Addresses           " -Items $script:VpnAddresses)
-        Write-Host (Format-ListDisplay -Label "8. Set DNS Suffixes            " -Items $script:QuodDnsSuffixes)
-        Write-Host "9. Save and Return"
-        Write-Host "0. Exit without Saving"
-        Write-Host "D. Create Desktop Shortcut (Ctrl+Alt+V)"
 
-        $setupChoice = Read-Host "Choose option"
-
-        if ($setupChoice -eq "9") {
-            Save-Settings
-            return
+        # Build item list each iteration so current values are always fresh
+        $setupItems = @(
+            @{ Key='1'; Label=("1. Set VPN Username            : [{0}]" -f $script:VpnUsername) }
+            @{ Key='2'; Label=("2. Set VPN Password            : [{0}]" -f $(if ($script:VpnPassword) {"Stored Securely"} else {"Not Set"})) }
+            @{ Key='3'; Label=("3. Set VPN Profile             : [{0}]" -f $script:VpnProfile) }
+            @{ Key='4'; Label=("4. Set OTP Secret              : [{0}]" -f $(if ($script:OtpSecret) {"Stored Securely"} else {"Not Set"})) }
+            @{ Key='5'; Label=("5. Set Cisco VPN CLI Path      : [{0}]" -f $script:CiscoVpnCliPath) }
+            @{ Key='6'; Label=("6. Set Cisco VPN UI Path       : [{0}]" -f $script:CiscoVpnUiPath) }
+            @{ Key='7'; Label=(Format-ListDisplay -Label "7. Set VPN Addresses           " -Items $script:VpnAddresses) }
+            @{ Key='8'; Label=(Format-ListDisplay -Label "8. Set DNS Suffixes            " -Items $script:QuodDnsSuffixes) }
+            @{ Key='9'; Label='9. Save and Return' }
+            @{ Key='0'; Label='0. Exit without Saving' }
+            @{ Key='D'; Label='D. Create Desktop Shortcut (Ctrl+Alt+V)' }
+        )
+        if ($script:SetupSelectedIndex -ge $setupItems.Count) {
+            $script:SetupSelectedIndex = $setupItems.Count - 1
         }
-        elseif ($setupChoice -eq "0") {
+
+        for ($i = 0; $i -lt $setupItems.Count; $i++) {
+            $isSel = ($i -eq $script:SetupSelectedIndex)
+            $line  = Format-MenuItem -Label $setupItems[$i].Label -IsSelected $isSel
+            if ($isSel -and $script:AnsiSupported) { Write-Host $line }
+            elseif ($isSel)                         { Write-Host $line -ForegroundColor Yellow }
+            else                                    { Write-Host $line }
+        }
+        Write-Host ""
+        Write-Host "  Use arrow keys to navigate or type a shortcut" -ForegroundColor DarkGray
+        Write-Host ""
+
+        # Drain buffer, then read one key
+        while ([System.Console]::KeyAvailable) { [void][System.Console]::ReadKey($true) }
+        $setupChoice = $null
+        while ($null -eq $setupChoice) {
+            if (-not [System.Console]::KeyAvailable) { Start-Sleep -Milliseconds 100; continue }
+            $k = [System.Console]::ReadKey($true)
+            if ($k.Key -eq [ConsoleKey]::UpArrow) {
+                $script:SetupSelectedIndex = [Math]::Max(0, $script:SetupSelectedIndex - 1)
+                $setupChoice = 'REDRAW'
+            } elseif ($k.Key -eq [ConsoleKey]::DownArrow) {
+                $script:SetupSelectedIndex = [Math]::Min($setupItems.Count - 1, $script:SetupSelectedIndex + 1)
+                $setupChoice = 'REDRAW'
+            } elseif ($k.Key -eq [ConsoleKey]::Enter) {
+                $setupChoice = $setupItems[$script:SetupSelectedIndex].Key
+            } elseif ($k.KeyChar -ne [char]0) {
+                $setupChoice = ([string]$k.KeyChar).ToUpper()
+            }
+        }
+        if ($setupChoice -eq 'REDRAW') { continue }
+
+        if ($setupChoice -eq '9') { Save-Settings; return }
+        if ($setupChoice -eq '0') {
             Write-Host "Exiting setup without saving changes." -ForegroundColor Yellow
             Start-Sleep -Seconds 1
             return
         }
 
         switch ($setupChoice) {
-            # Updated to use Console Safe Prompts
             "1" { $script:VpnUsername = Read-EditField -Prompt "VPN Username" -CurrentValue $script:VpnUsername }
             "2" { $script:VpnPassword = Read-EditField -Prompt "VPN Password" -CurrentValue "" -IsSecure }
             "3" { $script:VpnProfile = Read-EditField -Prompt "VPN Profile" -CurrentValue $script:VpnProfile }
@@ -2278,6 +2358,7 @@ try
                 Write-Host "--------------------------------------------" -ForegroundColor Cyan
                 Write-Host "Tests each VPN address using ICMP ping (preferred) or TCP port" -ForegroundColor DarkGray
                 Write-Host "connection (fallback if ICMP is blocked)." -ForegroundColor DarkGray
+                Write-Host "  Press Enter or Esc between tests to cancel." -ForegroundColor DarkGray
 
                 # Build ordered, de-duplicated list of VPN targets
                 $targets = New-Object System.Collections.Generic.List[string]
@@ -2296,12 +2377,22 @@ try
                 }
                 else {
                     $firstQualityInfo = $null
+                    $cancelled = $false
                     foreach ($addr in $targets) {
+                        # Check for cancel keystroke between tests
+                        if ([System.Console]::KeyAvailable) {
+                            $kc = [System.Console]::ReadKey($true)
+                            if ($kc.Key -eq [ConsoleKey]::Enter -or $kc.Key -eq [ConsoleKey]::Escape) {
+                                $cancelled = $true
+                                break
+                            }
+                        }
+
                         Write-Host ""
                         Write-Host ("Testing {0}..." -f $addr) -ForegroundColor Cyan
 
                         $qualityInfo = Get-VpnConnectionQuality -TargetHost $addr
-                        
+
                         # Cache first result for main menu display
                         if (-not $firstQualityInfo) {
                             $firstQualityInfo = $qualityInfo
@@ -2322,7 +2413,7 @@ try
                             Write-Host ("Result: {0} (target {1})" -f $qualityInfo.Quality, $qualityInfo.TargetHost) -ForegroundColor $qualityColor
                         }
                     }
-                    
+
                     # Cache results for main menu
                     if ($firstQualityInfo) {
                         $script:LastQualityInfo = $firstQualityInfo
@@ -2330,7 +2421,13 @@ try
                         $script:LastQualityCheckedAt = Get-Date
                     }
 
-                    Write-Host ""; Read-Host "Press Enter to return to the Main Menu" | Out-Null
+                    if ($cancelled) {
+                        Write-Host ""
+                        Write-Host "Test cancelled." -ForegroundColor Yellow
+                        Start-Sleep -Seconds 1
+                    } else {
+                        Write-Host ""; Read-Host "Press Enter to return to the Main Menu" | Out-Null
+                    }
                 }
             }
             "L" {
