@@ -89,8 +89,8 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.31"
-$VERSION_DATE   = "20MAR26"
+$SCRIPT_VERSION = "5.32"
+$VERSION_DATE   = "24MAR26"
 
 # --- TIMEOUT CONSTANTS ---
 # These govern internal subprocess waits and are not exposed as script parameters.
@@ -99,8 +99,11 @@ $UAC_ELEVATION_TIMEOUT_MS   = 30000  # Max wait for user to accept or decline a 
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
-- Kill: Access Denied when terminating QuodFrontEnd now triggers a UAC elevation
-  prompt so the kill is retried with admin rights, rather than silently failing.
+- Actionable OTP error messages with failure-specific detail (invalid Base32, DPAPI, missing secret).
+- VPN address entries normalised (strips http(s)://) and validated on input.
+- VPN profile matching tries exact name first; warns on ambiguous wildcard matches.
+- Internal WaitForExit timeouts replaced with named constants.
+- Main menu shows a persistent warning when config falls back to the script directory.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
