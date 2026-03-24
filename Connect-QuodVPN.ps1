@@ -89,7 +89,7 @@ param (
 # CONSTANTS & VERSION
 # =====================
 # --- VERSION CONTROL ---
-$SCRIPT_VERSION = "5.32"
+$SCRIPT_VERSION = "5.33"
 $VERSION_DATE   = "24MAR26"
 
 # --- TIMEOUT CONSTANTS ---
@@ -99,11 +99,17 @@ $UAC_ELEVATION_TIMEOUT_MS   = 30000  # Max wait for user to accept or decline a 
 
 # High-level notes for the current version (shown in Help screen)
 $script:VERSION_NOTES = @"
+5.32:
 - Actionable OTP error messages with failure-specific detail (invalid Base32, DPAPI, missing secret).
 - VPN address entries normalised (strips http(s)://) and validated on input.
 - VPN profile matching tries exact name first; warns on ambiguous wildcard matches.
 - Internal WaitForExit timeouts replaced with named constants.
 - Main menu shows a persistent warning when config falls back to the script directory.
+
+5.33:
+- Arrow-key navigation in main menu (use arrow keys to move, Enter to select).
+- ANSI reverse-video highlight on Windows Terminal / modern console; plain > prefix on legacy.
+- Arrow-key selection in VPN address picker replaces numbered Read-Host prompt.
 "@
 
 $QUOD_SETTINGS_FILENAME = "settings.xml"
@@ -190,6 +196,11 @@ $script:LastUserLogType      = $null
 $script:LastUserLogTimestamp = $null
 $script:LastOtpError         = $null    # Set by New-Otp on failure; callers read for display
 $script:UsingLegacyConfigPaths = $false # Set when Initialize-ConfigDirectory falls back to script dir
+
+# Arrow-key navigation state
+$script:MenuSelectedIndex = 0
+$script:AnsiSupported     = $false
+$script:ESC               = [char]27
 
 function Write-Log {
     param(
@@ -1295,70 +1306,133 @@ function Show-MainMenu {
     # Keep this header colour constant regardless of warnings above
     Write-Host "Quod Financial Applications Running:" -ForegroundColor Gray
     if ($quodProcs -and $quodProcs.Count -gt 0) {
-        $idx = 1
         foreach ($proc in $quodProcs) {
-            $label = "k$idx"
-            $desc = "[PID $($proc.Id)] $($proc.ProcessName) - $($proc.MainWindowTitle)"
-            Write-Host ("  " + $label + ": " + $desc) -ForegroundColor Green
-            $idx++
+            Write-Host ("  [PID $($proc.Id)] $($proc.ProcessName) - $($proc.MainWindowTitle)") -ForegroundColor Green
         }
-        Write-Host "  K: Kill All QuodFrontEnd" -ForegroundColor Red
     } else {
         Write-Host "  None" -ForegroundColor DarkGray
     }
-    Write-Host "" 
+    Write-Host ""
 
     $settingsAvailable = $true
     if (-not $script:VpnUsername -or -not $script:VpnPassword -or -not $script:VpnProfile -or -not $script:CiscoVpnCliPath) {
         $settingsAvailable = $false
     }
 
+    # Build ordered menu-item list
+    $menuItems = [System.Collections.Generic.List[hashtable]]::new()
     if ($settingsAvailable) {
-        Write-Host "1. Connect / Disconnect VPN"
+        $menuItems.Add(@{ Key='1'; Label='1. Connect / Disconnect VPN';         Color='White'   })
     } else {
-        Write-Host "1. Connect VPN Disabled - run Setup first" -ForegroundColor DarkGray
+        $menuItems.Add(@{ Key='1'; Label='1. Connect VPN Disabled - run Setup first'; Color='DarkGray' })
     }
-    Write-Host "2. Setup Options"
-    Write-Host "O. Show Current OTP"
-    Write-Host "H. Help / README"
-
+    $menuItems.Add(@{ Key='2'; Label='2. Setup Options';          Color='White' })
+    $menuItems.Add(@{ Key='O'; Label='O. Show Current OTP';       Color='White' })
+    $menuItems.Add(@{ Key='H'; Label='H. Help / README';          Color='White' })
     $lastVpnDisplay = if ($script:LastVpnAddress) { $script:LastVpnAddress } else { "[None]" }
-    Write-Host ("Q. Quick Connect ({0})" -f $lastVpnDisplay) -ForegroundColor Cyan
-    Write-Host "T. Connectivity Quality Test" -ForegroundColor White
-    Write-Host "L. Open Logs" -ForegroundColor White
-    Write-Host "9. Exit"
-    Write-Host "" 
+    $menuItems.Add(@{ Key='Q'; Label="Q. Quick Connect ($lastVpnDisplay)"; Color='Cyan' })
+    $menuItems.Add(@{ Key='T'; Label='T. Connectivity Quality Test'; Color='White' })
+    $menuItems.Add(@{ Key='L'; Label='L. Open Logs';              Color='White' })
+    $menuItems.Add(@{ Key='9'; Label='9. Exit';                   Color='White' })
 
-    $userInput = Read-Host "Enter your choice (or press Enter to refresh)"
-
-    # Handle Quod App kill options
+    # Append kill-process items when QuodFrontEnd is running
     if ($quodProcs -and $quodProcs.Count -gt 0) {
-        if ($userInput -match "^k([0-9]+)$") {
-            $killIdx = [int]$matches[1] - 1
-            if ($killIdx -ge 0 -and $killIdx -lt $quodProcs.Count) {
-                $procToKill = $quodProcs[$killIdx]
-                Write-Log "User requested kill of QuodFrontEnd index $($killIdx + 1): PID=$($procToKill.Id), Name=$($procToKill.ProcessName), Title='$($procToKill.MainWindowTitle)'"
-                $killed = Invoke-ElevatedKill -ProcessId $procToKill.Id -Label "QuodFrontEnd"
-                if ($killed) {
-                    Write-Log "Successfully terminated QuodFrontEnd process PID=$($procToKill.Id)."
-                } else {
-                    Write-Host "Error: could not terminate PID $($procToKill.Id). See VPN log for details." -ForegroundColor Red
-                    Start-Sleep -Seconds 2
+        $idx = 1
+        foreach ($proc in $quodProcs) {
+            $menuItems.Add(@{
+                Key   = "k$idx"
+                Label = "k${idx}: [PID $($proc.Id)] $($proc.ProcessName) - $($proc.MainWindowTitle)"
+                Color = 'Green'
+            })
+            $idx++
+        }
+        $menuItems.Add(@{ Key='K'; Label='K: Kill All QuodFrontEnd'; Color='Red' })
+    }
+
+    # Clamp cursor in case the item count shrank (e.g. a process exited)
+    if ($script:MenuSelectedIndex -ge $menuItems.Count) {
+        $script:MenuSelectedIndex = $menuItems.Count - 1
+    }
+
+    # Draw menu items with arrow-cursor indicator
+    for ($i = 0; $i -lt $menuItems.Count; $i++) {
+        $item = $menuItems[$i]
+        $line = Format-MenuItem -Label $item.Label -IsSelected ($i -eq $script:MenuSelectedIndex)
+        Write-Host $line -ForegroundColor $item.Color
+    }
+    Write-Host ""
+    Write-Host "  Use arrow keys to navigate or type a shortcut" -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Key-input loop: arrows navigate, Enter confirms, chars are legacy typed shortcuts
+    while ($true) {
+        if (-not [System.Console]::KeyAvailable) {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+        $k = [System.Console]::ReadKey($true)
+
+        if ($k.Key -eq [ConsoleKey]::UpArrow) {
+            $script:MenuSelectedIndex = [Math]::Max(0, $script:MenuSelectedIndex - 1)
+            return $null   # caller redraws
+        }
+        if ($k.Key -eq [ConsoleKey]::DownArrow) {
+            $script:MenuSelectedIndex = [Math]::Min($menuItems.Count - 1, $script:MenuSelectedIndex + 1)
+            return $null   # caller redraws
+        }
+        if ($k.Key -eq [ConsoleKey]::Enter) {
+            $selectedKey = $menuItems[$script:MenuSelectedIndex].Key
+            # Handle kill-process dispatch inline (same logic as before)
+            if ($quodProcs -and $quodProcs.Count -gt 0) {
+                if ($selectedKey -match "^k([0-9]+)$") {
+                    $killIdx = [int]$matches[1] - 1
+                    if ($killIdx -ge 0 -and $killIdx -lt $quodProcs.Count) {
+                        $procToKill = $quodProcs[$killIdx]
+                        Write-Log "User requested kill of QuodFrontEnd index $($killIdx + 1): PID=$($procToKill.Id), Name=$($procToKill.ProcessName), Title='$($procToKill.MainWindowTitle)'"
+                        $killed = Invoke-ElevatedKill -ProcessId $procToKill.Id -Label "QuodFrontEnd"
+                        if ($killed) {
+                            Write-Log "Successfully terminated QuodFrontEnd process PID=$($procToKill.Id)."
+                        } else {
+                            Write-Host "Error: could not terminate PID $($procToKill.Id). See VPN log for details." -ForegroundColor Red
+                            Start-Sleep -Seconds 2
+                        }
+                    }
+                    return $null
+                } elseif ($selectedKey -ieq 'K') {
+                    foreach ($proc in $quodProcs) {
+                        Write-Log "User requested kill-all of QuodFrontEnd: PID=$($proc.Id), Name=$($proc.ProcessName), Title='$($proc.MainWindowTitle)'"
+                        $killed = Invoke-ElevatedKill -ProcessId $proc.Id -Label "QuodFrontEnd (kill-all)"
+                        if ($killed) {
+                            Write-Log "Successfully terminated QuodFrontEnd (kill-all) PID=$($proc.Id)."
+                        } else {
+                            Write-Log "Failed to terminate QuodFrontEnd (kill-all) PID=$($proc.Id)." -LogType "Error"
+                        }
+                    }
+                    return $null
                 }
             }
-        } elseif ($userInput -ieq "K") {
-            foreach ($proc in $quodProcs) {
-                Write-Log "User requested kill-all of QuodFrontEnd: PID=$($proc.Id), Name=$($proc.ProcessName), Title='$($proc.MainWindowTitle)'"
-                $killed = Invoke-ElevatedKill -ProcessId $proc.Id -Label "QuodFrontEnd (kill-all)"
-                if ($killed) {
-                    Write-Log "Successfully terminated QuodFrontEnd (kill-all) PID=$($proc.Id)."
-                } else {
-                    Write-Log "Failed to terminate QuodFrontEnd (kill-all) PID=$($proc.Id)." -LogType "Error"
+            return $selectedKey
+        }
+
+        # Typed single-char shortcut (legacy direct-type mode)
+        if ($k.KeyChar -ne [char]0) {
+            $ch = ([string]$k.KeyChar).ToUpper()
+            # 'K' typed directly triggers kill-all when processes are present
+            if ($ch -eq 'K' -and $quodProcs -and $quodProcs.Count -gt 0) {
+                foreach ($proc in $quodProcs) {
+                    Write-Log "User requested kill-all of QuodFrontEnd: PID=$($proc.Id), Name=$($proc.ProcessName), Title='$($proc.MainWindowTitle)'"
+                    $killed = Invoke-ElevatedKill -ProcessId $proc.Id -Label "QuodFrontEnd (kill-all)"
+                    if ($killed) {
+                        Write-Log "Successfully terminated QuodFrontEnd (kill-all) PID=$($proc.Id)."
+                    } else {
+                        Write-Log "Failed to terminate QuodFrontEnd (kill-all) PID=$($proc.Id)." -LogType "Error"
+                    }
                 }
+                return $null
             }
+            return $ch
         }
     }
-    return $userInput
 }
 
 function Format-ListDisplay {
@@ -1368,6 +1442,23 @@ function Format-ListDisplay {
         $restLines = ($Items[1..($Items.Length-1)] | ForEach-Object {"`n" + (' ' * ($Label.Length + 4)) + $_}) -join ""
         return "$firstLine$restLines]"
     } else { return "{0} : [None]" -f $Label }
+}
+
+function Format-MenuItem {
+    # Returns a display string for one menu row.
+    # When selected: ">" prefix, plus ANSI reverse-video if supported.
+    # When not selected: two-space indent.
+    param(
+        [string]$Label,
+        [bool]$IsSelected = $false
+    )
+    if ($IsSelected) {
+        if ($script:AnsiSupported) {
+            return "$($script:ESC)[7m> $Label$($script:ESC)[0m"
+        }
+        return "> $Label"
+    }
+    return "  $Label"
 }
 
 # --- IMPROVED CONSOLE PROMPTS ---
@@ -2054,14 +2145,27 @@ function Invoke-VpnAddressSelection {
     if ($script:VpnAddresses.Count -eq 1) {
         Connect-Vpn -VpnAddress $script:VpnAddresses[0]
     } else {
-        $i = 1
-        foreach ($a in $script:VpnAddresses) { Write-Host "$i. $a"; $i++ }
-        $idx = Read-Host "Select Address"
-        if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $script:VpnAddresses.Count) {
-            Connect-Vpn -VpnAddress $script:VpnAddresses[[int]$idx - 1]
-        } else {
-            Write-Host "Invalid selection." -ForegroundColor Yellow
-            Start-Sleep -Seconds 1
+        $selIdx = 0
+        while ($true) {
+            Clear-Host
+            Write-Host "Select VPN Address (arrow keys + Enter, or Esc to cancel):" -ForegroundColor Cyan
+            Write-Host ""
+            for ($i = 0; $i -lt $script:VpnAddresses.Count; $i++) {
+                $line = Format-MenuItem -Label $script:VpnAddresses[$i] -IsSelected ($i -eq $selIdx)
+                Write-Host $line
+            }
+            Write-Host ""
+            $k = [System.Console]::ReadKey($true)
+            if     ($k.Key -eq [ConsoleKey]::UpArrow)   { $selIdx = [Math]::Max(0, $selIdx - 1) }
+            elseif ($k.Key -eq [ConsoleKey]::DownArrow) { $selIdx = [Math]::Min($script:VpnAddresses.Count - 1, $selIdx + 1) }
+            elseif ($k.Key -eq [ConsoleKey]::Enter)     { Connect-Vpn -VpnAddress $script:VpnAddresses[$selIdx]; return }
+            elseif ($k.Key -eq [ConsoleKey]::Escape)    { return }
+            elseif ($k.KeyChar -match '[1-9]') {
+                $n = [int][string]$k.KeyChar
+                if ($n -ge 1 -and $n -le $script:VpnAddresses.Count) {
+                    Connect-Vpn -VpnAddress $script:VpnAddresses[$n - 1]; return
+                }
+            }
         }
     }
 }
@@ -2069,6 +2173,29 @@ function Invoke-VpnAddressSelection {
 #region SCRIPT ENTRYPOINT
 try
 {
+    # Detect ANSI/VT support (Windows Terminal sets WT_SESSION; PS 6+ always supports it)
+    if ($env:WT_SESSION -or $PSVersionTable.PSVersion.Major -ge 6) {
+        $script:AnsiSupported = $true
+    } else {
+        try {
+            Add-Type -Name 'VTConsole' -Namespace '' -PassThru -MemberDefinition @'
+                [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+                public static extern System.IntPtr GetStdHandle(int h);
+                [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+                public static extern bool GetConsoleMode(System.IntPtr h, out uint m);
+                [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+                public static extern bool SetConsoleMode(System.IntPtr h, uint m);
+'@ -ErrorAction Stop | Out-Null
+            $hOut = [VTConsole]::GetStdHandle(-11)
+            $mode = 0u
+            if ([VTConsole]::GetConsoleMode($hOut, [ref]$mode)) {
+                $script:AnsiSupported = [VTConsole]::SetConsoleMode($hOut, $mode -bor 4)
+            }
+        } catch {
+            $script:AnsiSupported = $false
+        }
+    }
+
     Initialize-ConfigDirectory
     Initialize-LogMigration
     Get-Settings
@@ -2096,6 +2223,7 @@ try
 
     while ($true) {
         $choice = Show-MainMenu
+        if ($null -eq $choice) { continue }
         switch ($choice) {
             "1" {
                 if (Test-QuodNetwork) {
